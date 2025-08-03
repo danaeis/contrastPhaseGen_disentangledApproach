@@ -1,0 +1,406 @@
+CT contrast phase generation pipeline 
+The pipeline will use sinusoidal positional encoding for phase labels, a pre-trained MedViT-like model for the encoder, and the recommended training strategy (pre-train phase detector, then alternate training). I’ll ensure the code is optimized for training on an NVIDIA A100-40GB GPU and prioritizes efficient inference. The instructions will be clear, structured, and ready for implementation in PyTorch with MONAI for medical imaging tasks.
+
+---
+
+### Pipeline Specifications
+- **Contrast Phases**: Arterial, venous, delayed, non-contrast (4 phases).
+- **Volume Resolution**: Output resolution matches input (assumed to be \( 128 \times 128 \times 128 \times 1 \) for implementation; adjust as needed).
+- **Hardware**: NVIDIA A100-40GB GPU for training, with inference efficiency prioritized.
+- **Encoder**: Pre-trained MedViT-like model (e.g., MedViT or a 3D vision transformer adapted for medical imaging).
+- **Phase Encoding**: Sinusoidal positional encoding for phase labels to capture temporal order (arterial → venous → delayed → non-contrast).
+- **Training Strategy**:
+  - Pre-train phase detector (5-10 epochs) to ensure reliable phase prediction.
+  - Alternate training: 5 epochs for generator + discriminator, 5 epochs for phase detector with reverse gradient (\( \lambda \) from 0 to 1).
+- **Losses**:
+  - L1 loss for semi-paired data (approximate supervision due to misalignment).
+  - GAN loss for realism.
+  - Cross-entropy loss for phase detector.
+- **Data**: Semi-paired CT volumes (same patient, different regions/quality).
+
+---
+
+### Implementation Instructions
+
+Below is a detailed codebase in PyTorch, using MONAI for medical imaging tasks and a MedViT-like encoder. The code includes model definitions, sinusoidal phase encoding, the training strategy, and optimizations for the A100-40GB GPU. I’ll also provide guidance on inference efficiency and dataset handling.
+
+```python
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import monai
+from monai.networks.nets import ViT as MedViT  # MedViT-like vision transformer
+import numpy as np
+
+# Gradient Reversal Layer
+class GradientReversalLayer(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.lambda_ = lambda_
+        return x
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambda_ * grad_output, None
+
+# Sinusoidal Positional Encoding for Phases
+def get_phase_embedding(phase_index, dim=32):
+    """Generate sinusoidal positional encoding for phase index (0 to 3)."""
+    pe = torch.zeros(dim)
+    div_term = torch.exp(torch.arange(0, dim, 2) * (-torch.log(torch.tensor(10000.0)) / dim))
+    pe[0::2] = torch.sin(phase_index * div_term)
+    pe[1::2] = torch.cos(phase_index * div_term)
+    return pe
+
+# Encoder: MedViT-like 3D Vision Transformer
+class Encoder(nn.Module):
+    def __init__(self, input_shape=(128, 128, 128, 1), latent_dim=256):
+        super().__init__()
+        # MedViT configuration: adjust patch_size and hidden_size for A100-40GB
+        self.vit = MedViT(
+            in_channels=1,
+            img_size=input_shape[:-1],
+            patch_size=16,
+            hidden_size=384,  # Reduced for memory efficiency
+            mlp_dim=1536,
+            num_heads=12,
+            num_layers=12,
+            classification=False
+        )
+        self.fc = nn.Linear(384, latent_dim)  # Map ViT output to latent_dim
+
+    def forward(self, x):
+        # x: (batch, 1, 128, 128, 128)
+        features = self.vit(x)  # ViT output: (batch, hidden_size)
+        z = self.fc(features)   # z: (batch, latent_dim)
+        return z
+
+# Generator: 3D Deconvolutional Network
+class Generator(nn.Module):
+    def __init__(self, latent_dim=256, phase_dim=32, output_shape=(128, 128, 128, 1)):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.phase_dim = phase_dim
+        # Initial dense layer to project to 3D feature map
+        self.fc = nn.Linear(latent_dim + phase_dim, 8 * 8 * 8 * 256)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose3d(256, 128, kernel_size=4, stride=2, padding=1),  # 8x8x8 -> 16x16x16
+            nn.BatchNorm3d(128),
+            nn.ReLU(),
+            nn.ConvTranspose3d(128, 64, kernel_size=4, stride=2, padding=1),   # 16x16x16 -> 32x32x32
+            nn.BatchNorm3d(64),
+            nn.ReLU(),
+            nn.ConvTranspose3d(64, 32, kernel_size=4, stride=2, padding=1),    # 32x32x32 -> 64x64x64
+            nn.BatchNorm3d(32),
+            nn.ReLU(),
+            nn.ConvTranspose3d(32, 1, kernel_size=4, stride=2, padding=1),     # 64x64x64 -> 128x128x128
+            nn.Sigmoid()  # Normalize output to [0, 1]
+        )
+
+    def forward(self, z, phase_emb):
+        # z: (batch, latent_dim), phase_emb: (batch, phase_dim)
+        x = torch.cat([z, phase_emb], dim=1)  # (batch, latent_dim + phase_dim)
+        x = self.fc(x)  # (batch, 8*8*8*256)
+        x = x.view(-1, 256, 8, 8, 8)  # Reshape to 3D
+        return self.decoder(x)  # (batch, 1, 128, 128, 128)
+
+# Discriminator: PatchGAN-style 3D CNN
+class Discriminator(nn.Module):
+    def __init__(self, input_shape=(128, 128, 128, 1)):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Conv3d(1, 64, kernel_size=4, stride=2, padding=1),  # 128x128x128 -> 64x64x64
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(64, 128, kernel_size=4, stride=2, padding=1),  # 64x64x64 -> 32x32x32
+            nn.BatchNorm3d(128),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(128, 256, kernel_size=4, stride=2, padding=1),  # 32x32x32 -> 16x16x16
+            nn.BatchNorm3d(256),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(256, 1, kernel_size=4, stride=1, padding=0),   # 16x16x16 -> 13x13x13
+            nn.Sigmoid()  # PatchGAN output
+        )
+
+    def forward(self, x):
+        return self.model(x).view(-1, 1)  # (batch, 1)
+
+# Phase Detector
+class PhaseDetector(nn.Module):
+    def __init__(self, latent_dim=256, num_phases=4):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_phases),
+            nn.Softmax(dim=1)
+        )
+
+    def forward(self, z):
+        return self.model(z)  # (batch, num_phases)
+
+# Training Function
+def train_contrast_phase_generation(
+    data_loader,
+    encoder,
+    generator,
+    discriminator,
+    phase_detector,
+    num_epochs=100,
+    device="cuda"
+):
+    # Losses
+    l1_loss = nn.L1Loss()
+    gan_loss = nn.BCEWithLogitsLoss()
+    phase_loss = nn.CrossEntropyLoss()
+
+    # Optimizers
+    optimizer_enc_gen = optim.Adam(list(encoder.parameters()) + list(generator.parameters()), lr=1e-4)
+    optimizer_disc = optim.Adam(discriminator.parameters(), lr=1e-4)
+    optimizer_phase = optim.Adam(phase_detector.parameters(), lr=1e-4)
+
+    # Move models to device
+    encoder.to(device)
+    generator.to(device)
+    discriminator.to(device)
+    phase_detector.to(device)
+
+    # Training loop
+    for epoch in range(num_epochs):
+        lambda_ = min(1.0, (epoch - 10) / 50.0) if epoch >= 10 else 0.0  # Reverse gradient after pre-training
+
+        for batch in data_loader:
+            input_volume = batch["input_volume"].to(device)  # (batch, 1, 128, 128, 128)
+            target_volume = batch["target_volume"].to(device)  # (batch, 1, 128, 128, 128)
+            phase_label = batch["target_phase"].to(device)  # (batch,) e.g., 0, 1, 2, 3
+            true_phase_label = batch["input_phase"].to(device)  # For phase detector
+
+            if epoch < 10:
+                # Pre-train phase detector
+                encoder.eval()
+                generator.eval()
+                discriminator.eval()
+                phase_detector.train()
+                z = encoder(input_volume)
+                phase_pred = phase_detector(z)
+                p_loss = phase_loss(phase_pred, true_phase_label)
+                optimizer_phase.zero_grad()
+                p_loss.backward()
+                optimizer_phase.step()
+                print(f"Epoch {epoch}, Phase Detector Loss: {p_loss.item():.4f}")
+            elif epoch % 10 < 5:
+                # Train generator and discriminator
+                encoder.train()
+                generator.train()
+                discriminator.train()
+                phase_detector.eval()
+                z = encoder(input_volume)
+                phase_emb = torch.stack([get_phase_embedding(p, dim=32).to(device) for p in phase_label])
+                generated_volume = generator(z, phase_emb)
+                real_score = discriminator(target_volume)
+                fake_score = discriminator(generated_volume)
+                g_loss = l1_loss(generated_volume, target_volume) * 10.0 + gan_loss(fake_score, torch.ones_like(fake_score))
+                d_loss = gan_loss(real_score, torch.ones_like(real_score)) + gan_loss(fake_score, torch.zeros_like(fake_score))
+                optimizer_enc_gen.zero_grad()
+                g_loss.backward()
+                optimizer_enc_gen.step()
+                optimizer_disc.zero_grad()
+                d_loss.backward()
+                optimizer_disc.step()
+                print(f"Epoch {epoch}, G Loss: {g_loss.item():.4f}, D Loss: {d_loss.item():.4f}")
+            else:
+                # Train phase detector with reverse gradient
+                encoder.train()
+                generator.eval()
+                discriminator.eval()
+                phase_detector.train()
+                z = encoder(input_volume)
+                z_reversed = GradientReversalLayer.apply(z, lambda_)
+                phase_pred = phase_detector(z_reversed)
+                p_loss = phase_loss(phase_pred, true_phase_label)
+                optimizer_phase.zero_grad()
+                p_loss.backward()
+                optimizer_phase.step()
+                print(f"Epoch {epoch}, Phase Detector Loss: {p_loss.item():.4f}, Lambda: {lambda_:.4f}")
+
+# Dataset and DataLoader
+from monai.data import Dataset, DataLoader
+from monai.transforms import (
+    LoadImaged,
+    EnsureChannelFirstd,
+    ScaleIntensityRanged,
+    Resized,
+    ToTensord
+)
+
+def prepare_data(data_dicts, batch_size=2):
+    """Prepare MONAI dataset and DataLoader."""
+    transform = monai.transforms.Compose([
+        LoadImaged(keys=["input_volume", "target_volume"]),
+        EnsureChannelFirstd(keys=["input_volume", "target_volume"]),
+        ScaleIntensityRanged(keys=["input_volume", "target_volume"], a_min=-1000, a_max=1000, b_min=0.0, b_max=1.0),
+        Resized(keys=["input_volume", "target_volume"], spatial_size=(128, 128, 128)),
+        ToTensord(keys=["input_volume", "target_volume", "input_phase", "target_phase"])
+    ])
+    dataset = Dataset(data_dicts, transform=transform)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+
+# Example usage
+if __name__ == "__main__":
+    # Example data dictionary
+    data_dicts = [
+        {
+            "input_volume": "path/to/arterial.nii.gz",
+            "target_volume": "path/to/venous.nii.gz",
+            "input_phase": 0,  # Arterial
+            "target_phase": 1  # Venous
+        },
+        # Add more entries
+    ]
+    data_loader = prepare_data(data_dicts, batch_size=2)
+
+    # Initialize models
+    encoder = Encoder(input_shape=(128, 128, 128, 1), latent_dim=256)
+    generator = Generator(latent_dim=256, phase_dim=32, output_shape=(128, 128, 128, 1))
+    discriminator = Discriminator(input_shape=(128, 128, 128, 1))
+    phase_detector = PhaseDetector(latent_dim=256, num_phases=4)
+
+    # Load pre-trained MedViT weights (adjust path as needed)
+    # encoder.vit.load_state_dict(torch.load("path/to/pretrained_medvit.pth"))
+
+    # Train
+    train_contrast_phase_generation(
+        data_loader,
+        encoder,
+        generator,
+        discriminator,
+        phase_detector,
+        num_epochs=100,
+        device="cuda"
+    )
+```
+
+---
+
+### Implementation Guidance
+
+#### 1. Setup Environment
+- **Dependencies**:
+  - PyTorch: `pip install torch`
+  - MONAI: `pip install monai`
+  - Optional: SimpleITK for registration (`pip install SimpleITK`)
+- **Hardware**: NVIDIA A100-40GB GPU.
+  - Batch size: Set to 2 for \( 128 \times 128 \times 128 \) volumes to fit in 40GB memory. Adjust to 1 if memory errors occur.
+  - Use mixed precision training (via `torch.cuda.amp`) to reduce memory usage:
+    ```python
+    from torch.cuda.amp import autocast, GradScaler
+    scaler = GradScaler()
+    with autocast():
+        # Forward pass
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+    ```
+
+#### 2. Dataset Preparation
+- **Format**: CT volumes in NIfTI format (.nii.gz).
+- **Structure**: Create a list of dictionaries, each containing:
+  - `input_volume`: Path to input CT volume (e.g., arterial).
+  - `target_volume`: Path to target CT volume (e.g., venous).
+  - `input_phase`: Integer (0: arterial, 1: venous, 2: delayed, 3: non-contrast).
+  - `target_phase`: Integer for target phase.
+- **Preprocessing**:
+  - Use MONAI transforms to load, normalize, and resize volumes to \( 128 \times 128 \times 128 \).
+  - Normalize Hounsfield units (e.g., [-1000, 1000] → [0, 1]).
+  - Optional: Apply approximate registration with SimpleITK to align volumes:
+    ```python
+    import SimpleITK as sitk
+    def register_volumes(fixed, moving):
+        transform = sitk.CenteredTransformInitializer(fixed, moving, sitk.Euler3DTransform())
+        registered = sitk.Resample(moving, fixed, transform)
+        return registered
+    ```
+- **Data Augmentation**: Add random rotations, flips, or intensity shifts using MONAI transforms to improve generalization.
+
+#### 3. Model Details
+- **Encoder**:
+  - Uses a MedViT-like 3D vision transformer (from MONAI).
+  - Pre-trained weights: Download from a medical imaging model zoo (e.g., MONAI model zoo or MedViT repository) and load into `encoder.vit`.
+  - Reduced `hidden_size=384` to fit A100-40GB memory.
+- **Generator**:
+  - 3D deconvolutional network with transposed convolutions.
+  - Outputs \( 128 \times 128 \times 128 \times 1 \) volume.
+- **Discriminator**:
+  - PatchGAN-style to reduce memory usage (outputs patches instead of a single scalar).
+- **Phase Detector**:
+  - Lightweight MLP to predict one of 4 phases.
+- **Phase Encoding**:
+  - Sinusoidal encoding with `dim=32` to capture phase order.
+
+#### 4. Training Strategy
+- **Phase 1 (Epochs 0-9)**: Pre-train phase detector (freeze encoder, generator, discriminator) to achieve high accuracy (>80%).
+- **Phase 2 (Epochs 10-100)**:
+  - Alternate every 5 epochs:
+    - Generator + Discriminator: Optimize encoder and generator with \( \mathcal{L}_{G} = 10 \cdot \mathcal{L}_{L1} + \mathcal{L}_{GAN} \).
+    - Phase Detector: Optimize phase detector with reverse gradient (\( \lambda = \min(1.0, (epoch-10)/50) \)).
+- **Monitoring**:
+  - Log losses (L1, GAN, phase detector).
+  - Track phase detector accuracy (should decrease as disentanglement improves).
+  - Compute SSIM/PSNR on validation set for semi-paired data.
+  - Visualize generated volumes using 3D Slicer or ITK-SNAP.
+
+#### 5. Inference Optimization
+- **Goal**: Fast inference for practical use.
+- **Optimizations**:
+  - Use `torch.jit.trace` or `torch.compile` to optimize the encoder and generator:
+    ```python
+    traced_encoder = torch.jit.trace(encoder, torch.randn(1, 1, 128, 128, 128).cuda())
+    traced_generator = torch.jit.trace(generator, (torch.randn(1, 256).cuda(), torch.randn(1, 32).cuda()))
+    ```
+  - Reduce model size: Use `hidden_size=384` in MedViT and lightweight generator/discriminator.
+  - Enable mixed precision inference:
+    ```python
+    with torch.no_grad(), autocast():
+        z = traced_encoder(input_volume)
+        phase_emb = get_phase_embedding(target_phase).cuda()
+        generated_volume = traced_generator(z, phase_emb)
+    ```
+  - Batch inference: Process multiple volumes (e.g., batch size 4) to leverage A100 parallelism.
+- **Expected Inference Time**: For \( 128 \times 128 \times 128 \), expect ~0.5-1 second per volume on A100 with optimizations.
+
+#### 6. Evaluation
+- **Metrics**:
+  - L1 loss for approximate supervision.
+  - SSIM/PSNR for structural similarity.
+  - FID for GAN quality (use a pre-trained 3D CNN as feature extractor).
+- **Visualization**:
+  - Save generated volumes as NIfTI files:
+    ```python
+    import nibabel as nib
+    def save_volume(volume, path):
+        volume_np = volume.cpu().numpy().squeeze()
+        nii_img = nib.Nifti1Image(volume_np, affine=np.eye(4))
+        nib.save(nii_img, path)
+    ```
+
+---
+
+### Additional Notes
+- **Dataset Size**: Ensure enough paired data (e.g., 100+ patients with all 4 phases) to train robustly. Use augmentation if data is limited.
+- **Checkpointing**: Save model weights every 10 epochs:
+  ```python
+  torch.save(encoder.state_dict(), f"encoder_epoch_{epoch}.pth")
+  ```
+- **Debugging**:
+  - Check for NaN losses (reduce learning rate if unstable).
+  - Visualize intermediate embeddings \( z \) using t-SNE to ensure disentanglement.
+- **Remaining Clarifications**:
+  - Confirm input volume resolution (assumed \( 128 \times 128 \times 128 \)). Adjust `input_shape` and `Resized` transform if different.
+  - Provide path to pre-trained MedViT weights or confirm if training from scratch.
+
+---
+
+### Next Steps
+1. Prepare your dataset in the specified dictionary format.
+2. Download pre-trained MedViT weights (or train from scratch if unavailable).
+3. Run the provided code, adjusting paths and hyperparameters as needed.
+4. Monitor training with loss curves and validation metrics.
+5. Optimize inference with tracing and mixed precision.
