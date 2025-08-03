@@ -66,102 +66,89 @@ def register_volumes(fixed_path, moving_path, output_path=None):
 import os
 import pandas as pd
 
-def prepare_dataset_from_folders(data_root, labels_csv, validation_split=0.2, seed=42):
-    """Prepare dataset from folders with scan_ids containing NIfTI files and a labels.csv file.
+def prepare_dataset_from_folders(data_root, labels_csv, validation_split=0.2, seed=42, apply_registration=False):
+    # First, validate dataset
+    report, pairs_df = validate_dataset(data_root, labels_csv)
+    print("Validation Report:")
+    print(report)
     
-    Args:
-        data_root: Root directory containing scan_id folders
-        labels_csv: Path to CSV file with phase labels
-        validation_split: Fraction of data to use for validation
-        seed: Random seed for reproducibility
-        
-    Returns:
-        train_data_dicts: List of dictionaries for training
-        val_data_dicts: List of dictionaries for validation
-    """
-    # Load labels
-    labels_df = pd.read_csv(labels_csv)
+    if 'error' in report:
+        raise ValueError(report['error'])
     
-    # Organize volumes by scan_id and phase
-    volumes_by_scan_id = {}
+    if apply_registration:
+        # Apply registration to each scan
+        for scan_id in pairs_df['scan_id'].unique():
+            scan_dir = os.path.join(data_root, scan_id)
+            output_dir = os.path.join(data_root, f"{scan_id}_registered")
+            register_case_series(scan_dir, output_dir)
+            # Update paths in pairs_df to registered versions
+            pairs_df.loc[pairs_df['scan_id'] == scan_id, 'input_path'] = pairs_df['input_path'].apply(
+                lambda p: p.replace(scan_dir, output_dir).replace('.nii.gz', '_registered.nii.gz')
+            )
+            pairs_df.loc[pairs_df['scan_id'] == scan_id, 'target_path'] = pairs_df['target_path'].apply(
+                lambda p: p.replace(scan_dir, output_dir).replace('.nii.gz', '_registered.nii.gz')
+            )
     
-    # Map phase names to integers
-    phase_to_int = {
-        'arterial': 0,
-        'venous': 1,
-        'delayed': 2,
-        'non-contrast': 3
-    }
-    
-    # Process each scan_id folder
-    scan_ids = [d for d in os.listdir(data_root) if os.path.isdir(os.path.join(data_root, d))]
-    
-    for scan_id in scan_ids:
-        scan_dir = os.path.join(data_root, scan_id)
-        nifti_files = [f for f in os.listdir(scan_dir) if f.endswith('.nii.gz')]
-        
-        # Get phase labels for this scan_id from the CSV
-        scan_labels = labels_df[labels_df['scan_id'] == scan_id]
-        
-        if len(scan_labels) == 0:
-            print(f"Warning: No labels found for scan_id {scan_id}")
-            continue
-        
-        volumes_by_scan_id[scan_id] = {}
-        
-        for nifti_file in nifti_files:
-            file_path = os.path.join(scan_dir, nifti_file)
-            
-            # Extract phase from filename or use label from CSV
-            # Assuming filename contains phase information or can be matched with CSV
-            for _, row in scan_labels.iterrows():
-                if row['filename'] in nifti_file:
-                    phase = row['phase']
-                    phase_int = phase_to_int.get(phase.lower(), None)
-                    
-                    if phase_int is not None:
-                        volumes_by_scan_id[scan_id][phase_int] = file_path
-                    else:
-                        print(f"Warning: Unknown phase '{phase}' for file {nifti_file}")
-    
-    # Create input-target pairs for training
+    # Create data_dicts from pairs_df
     data_dicts = []
+    for _, row in pairs_df.iterrows():
+        data_dicts.append({
+            "input_volume": row['input_path'],
+            "target_volume": row['target_path'],
+            "input_phase": row['input_phase'],
+            "target_phase": row['target_phase'],
+            "scan_id": row['scan_id']
+        })
     
-    for scan_id, phases in volumes_by_scan_id.items():
-        # Only use scans that have at least 2 phases
-        if len(phases) < 2:
-            continue
-        
-        # Create all possible pairs of phases
-        phase_ids = list(phases.keys())
-        for i, input_phase in enumerate(phase_ids):
-            for target_phase in phase_ids[i+1:]:  # Only use phases after the current one
-                data_dicts.append({
-                    "input_volume": volumes_by_scan_id[scan_id][input_phase],
-                    "target_volume": volumes_by_scan_id[scan_id][target_phase],
-                    "input_phase": input_phase,
-                    "target_phase": target_phase,
-                    "scan_id": scan_id
-                })
-                
-                # Also add the reverse direction
-                data_dicts.append({
-                    "input_volume": volumes_by_scan_id[scan_id][target_phase],
-                    "target_volume": volumes_by_scan_id[scan_id][input_phase],
-                    "input_phase": target_phase,
-                    "target_phase": input_phase,
-                    "scan_id": scan_id
-                })
-    
-    # Split into training and validation sets
+    # Split into train/val
     import numpy as np
     np.random.seed(seed)
     np.random.shuffle(data_dicts)
-    
     split_idx = int(len(data_dicts) * (1 - validation_split))
     train_data_dicts = data_dicts[:split_idx]
     val_data_dicts = data_dicts[split_idx:]
     
-    print(f"Created {len(train_data_dicts)} training samples and {len(val_data_dicts)} validation samples")
-    
     return train_data_dicts, val_data_dicts
+
+import SimpleITK as sitk
+
+def register_case_series(scan_dir, output_dir, non_contrast_file='non_contrast.nii.gz'):
+    """Perform rigid registration on series of a case using non-contrast as atlas.
+    
+    Args:
+        scan_dir: Directory of the scan_id
+        output_dir: Directory to save registered volumes
+        non_contrast_file: Filename of non-contrast volume
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    fixed_path = os.path.join(scan_dir, non_contrast_file)
+    if not os.path.exists(fixed_path):
+        print(f"Non-contrast file not found: {fixed_path}")
+        return
+    
+    fixed = sitk.ReadImage(fixed_path)
+    
+    nifti_files = [f for f in os.listdir(scan_dir) if f.endswith('.nii.gz') and f != non_contrast_file]
+    
+    for moving_file in nifti_files:
+        moving_path = os.path.join(scan_dir, moving_file)
+        moving = sitk.ReadImage(moving_path)
+        
+        # Initialize rigid transform
+        transform = sitk.CenteredTransformInitializer(
+            fixed, moving, sitk.Euler3DTransform(), 
+            sitk.CenteredTransformInitializerFilter.GEOMETRY
+        )
+        
+        # Resample
+        registered = sitk.Resample(moving, fixed, transform, sitk.sitkLinear, 0.0)
+        
+        # Save
+        output_path = os.path.join(output_dir, f"registered_{moving_file}")
+        sitk.WriteImage(registered, output_path)
+        print(f"Registered {moving_file} to {output_path}")
+    
+    # Copy non-contrast as is
+    import shutil
+    shutil.copy(fixed_path, os.path.join(output_dir, non_contrast_file))
