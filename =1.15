@@ -1,0 +1,24 @@
+Collecting tensorboard!=2.1.0
+  Downloading tensorboard-2.20.0-py3-none-any.whl.metadata (1.8 kB)
+Requirement already satisfied: absl-py>=0.4 in /home/saeedeh_danaei/.local/lib/python3.10/site-packages (from tensorboard!=2.1.0) (2.3.0)
+Requirement already satisfied: grpcio>=1.48.2 in /home/saeedeh_danaei/.local/lib/python3.10/site-packages (from tensorboard!=2.1.0) (1.72.1)
+Collecting markdown>=2.6.8 (from tensorboard!=2.1.0)
+  Using cached markdown-3.8.2-py3-none-any.whl.metadata (5.1 kB)
+Requirement already satisfied: numpy>=1.12.0 in /media/disk1/saeedeh_danaei/miniconda3/envs/contphase_disent/lib/python3.10/site-packages (from tensorboard!=2.1.0) (2.2.6)
+Requirement already satisfied: packaging in /media/disk1/saeedeh_danaei/miniconda3/envs/contphase_disent/lib/python3.10/site-packages (from tensorboard!=2.1.0) (25.0)
+Collecting pillow (from tensorboard!=2.1.0)
+  Using cached pillow-11.3.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (9.0 kB)
+Collecting protobuf!=4.24.0,>=3.19.6 (from tensorboard!=2.1.0)
+  Downloading protobuf-6.31.1-cp39-abi3-manylinux2014_x86_64.whl.metadata (593 bytes)
+Requirement already satisfied: setuptools>=41.0.0 in /media/disk1/saeedeh_danaei/miniconda3/envs/contphase_disent/lib/python3.10/site-packages (from tensorboard!=2.1.0) (78.1.1)
+Requirement already satisfied: tensorboard-data-server<0.8.0,>=0.7.0 in /home/saeedeh_danaei/.local/lib/python3.10/site-packages (from tensorboard!=2.1.0) (0.7.2)
+Requirement already satisfied: werkzeug>=1.0.1 in /home/saeedeh_danaei/.local/lib/python3.10/site-packages (from tensorboard!=2.1.0) (3.1.3)
+Requirement already satisfied: MarkupSafe>=2.1.1 in /home/saeedeh_danaei/.local/lib/python3.10/site-packages (from werkzeug>=1.0.1->tensorboard!=2.1.0) (3.0.2)
+Downloading tensorboard-2.20.0-py3-none-any.whl (5.5 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 5.5/5.5 MB 2.9 MB/s eta 0:00:00
+Using cached markdown-3.8.2-py3-none-any.whl (106 kB)
+Downloading protobuf-6.31.1-cp39-abi3-manylinux2014_x86_64.whl (321 kB)
+Using cached pillow-11.3.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (6.6 MB)
+Installing collected packages: protobuf, pillow, markdown, tensorboard
+
+Successfully installed markdown-3.8.2 pillow-11.3.0 protobuf-6.31.1 tensorboard-2.20.0
