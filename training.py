@@ -48,7 +48,8 @@ def train_contrast_phase_generation(
         "p_losses": [],
         "phase_accuracy": []
     }
-
+    print(f"Starting training with {len(data_loader)} batches per epoch")
+    print(f"Device: {device}, Mixed Precision: {use_mixed_precision}")
     # Training loop
     for epoch in range(num_epochs):
         # Calculate lambda for gradient reversal (0 to 1 over epochs 10-60)
@@ -223,4 +224,50 @@ def train_contrast_phase_generation(
             torch.save(generator.state_dict(), os.path.join(checkpoint_dir, f"generator_epoch_{epoch+1}.pth"))
             torch.save(phase_detector.state_dict(), os.path.join(checkpoint_dir, f"phase_detector_epoch_{epoch+1}.pth"))
             
+        if validation_loader is not None:
+            print("Running validation...")
+            encoder.eval()
+            generator.eval()
+            discriminator.eval()
+            phase_detector.eval()
+            
+            val_g_loss = 0.0
+            val_p_accuracy = 0.0
+            val_batches = 0
+            
+            with torch.no_grad():
+                for val_batch in validation_loader:
+                    input_volume = val_batch["input_volume"].to(device)
+                    target_volume = val_batch["target_volume"].to(device)
+                    phase_label = val_batch["target_phase"].to(device)
+                    true_phase_label = val_batch["input_phase"].to(device)
+                    
+                    # Forward pass
+                    z = encoder(input_volume)
+                    phase_emb = torch.stack([get_phase_embedding(p, dim=32).to(device) for p in phase_label])
+                    generated_volume = generator(z, phase_emb)
+                    phase_pred = phase_detector(z)
+                    
+                    # Calculate losses
+                    val_g_loss += l1_loss(generated_volume, target_volume).item()
+                    
+                    # Phase accuracy
+                    _, predicted = torch.max(phase_pred.data, 1)
+                    val_p_accuracy += (predicted == true_phase_label).sum().item() / true_phase_label.size(0)
+                    
+                    val_batches += 1
+            
+            val_g_loss /= val_batches
+            val_p_accuracy /= val_batches
+            
+            print(f"Validation - G_loss: {val_g_loss:.4f}, Phase Accuracy: {val_p_accuracy:.4f}")
+            
+            # Add to metrics
+            if 'val_g_losses' not in metrics:
+                metrics['val_g_losses'] = []
+            if 'val_phase_accuracy' not in metrics:
+                metrics['val_phase_accuracy'] = []
+            
+            metrics['val_g_losses'].append(val_g_loss)
+            metrics['val_phase_accuracy'].append(val_p_accuracy)
     return metrics

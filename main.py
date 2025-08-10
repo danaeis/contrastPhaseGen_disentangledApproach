@@ -2,7 +2,7 @@ import torch
 import argparse
 import os
 from models import Encoder, Generator, Discriminator, PhaseDetector
-from data import prepare_data
+from data import prepare_data, prepare_dataset_from_folders
 from training import train_contrast_phase_generation
 from inference import benchmark_inference, generate_contrast_phase, save_volume
 
@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--input_phase", type=int, choices=[0, 1, 2, 3], help="Input phase (0: arterial, 1: venous, 2: delayed, 3: non-contrast)")
     parser.add_argument("--target_phase", type=int, choices=[0, 1, 2, 3], help="Target phase (0: arterial, 1: venous, 2: delayed, 3: non-contrast)")
     parser.add_argument("--output_path", type=str, help="Path to save generated volume")
+    parser.add_argument("--apply_registration", action="store_true", help="Apply registration to align volumes before training")
     
     args = parser.parse_args()
     
@@ -50,8 +51,13 @@ def main():
         train_data_dicts, val_data_dicts = prepare_dataset_from_folders(
             args.data_path,
             labels_csv,
-            validation_split=0.2
+            validation_split=0.2,
+            apply_registration=args.apply_registration  # Pass the registration argument
         )
+        
+        print(f"Training with {len(train_data_dicts)} samples, validating with {len(val_data_dicts)} samples")
+        if args.apply_registration:
+            print("Registration applied to align volumes")
         
         # Create data loaders
         train_loader = prepare_data(train_data_dicts, batch_size=args.batch_size)
