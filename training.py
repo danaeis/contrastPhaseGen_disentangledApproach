@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import os
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from utils import GradientReversalLayer, get_phase_embedding
 import numpy as np
 from tqdm import tqdm
@@ -96,7 +96,7 @@ def train_contrast_phase_generation(
                 # Pre-train phase detector
                 optimizer_phase.zero_grad()
                 
-                with autocast(enabled=use_mixed_precision):
+                with autocast(device_type="cuda", enabled=use_mixed_precision):
                     z = encoder(input_volume)
                     phase_pred = phase_detector(z)
                     p_loss = phase_loss(phase_pred, true_phase_label)
@@ -120,7 +120,7 @@ def train_contrast_phase_generation(
                 optimizer_enc_gen.zero_grad()
                 optimizer_disc.zero_grad()
                 
-                with autocast(enabled=use_mixed_precision):
+                with autocast(device_type="cuda", enabled=use_mixed_precision):
                     # Forward pass
                     z = encoder(input_volume)
                     phase_emb = torch.stack([get_phase_embedding(p, dim=32).to(device) for p in phase_label])
@@ -146,7 +146,7 @@ def train_contrast_phase_generation(
                 # Generator forward pass (need to recompute fake_score since we detached earlier)
                 optimizer_enc_gen.zero_grad()
                 
-                with autocast(enabled=use_mixed_precision):
+                with autocast(device_type="cuda", enabled=use_mixed_precision):
                     fake_score = discriminator(generated_volume)
                     
                     # Generator loss (L1 + GAN)
@@ -170,7 +170,7 @@ def train_contrast_phase_generation(
                 # Train phase detector with reverse gradient
                 optimizer_phase.zero_grad()
                 
-                with autocast(enabled=use_mixed_precision):
+                with autocast(device_type="cuda", enabled=use_mixed_precision):
                     z = encoder(input_volume)
                     z_reversed = GradientReversalLayer.apply(z, lambda_)
                     phase_pred = phase_detector(z_reversed)

@@ -1,27 +1,44 @@
 import torch
 import torch.nn as nn
-from monai.networks.nets import ViT as MedViT
+from monai.networks.nets import ViT
 
 # Encoder: MedViT-like 3D Vision Transformer
 class Encoder(nn.Module):
-    def __init__(self, input_shape=(128, 128, 128, 1), latent_dim=256):
+    def __init__(
+        self,
+        in_channels: int = 1,
+        img_size=(128, 128, 128),
+        vit_hidden_size: int = 384,
+        latent_dim: int = 256,
+        patch_size: int = 16,
+        num_heads: int = 12,
+        num_layers: int = 12,
+    ):
         super().__init__()
-        # MedViT configuration: adjust patch_size and hidden_size for A100-40GB
-        self.vit = MedViT(
-            in_channels=1,
-            img_size=input_shape[:-1],
-            patch_size=16,
-            hidden_size=384,  # Reduced for memory efficiency
-            mlp_dim=1536,
-            num_heads=12,
-            num_layers=12,
-            classification=False
+        # ViT configuration
+        self.vit = ViT(
+            in_channels=in_channels,
+            img_size=img_size,
+            patch_size=patch_size,
+            hidden_size=vit_hidden_size,
+            mlp_dim=vit_hidden_size * 4,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            classification=False,
         )
-        self.fc = nn.Linear(384, latent_dim)  # Map ViT output to latent_dim
+        # Determine actual hidden size from model if available
+        actual_hidden = getattr(self.vit, "hidden_size", vit_hidden_size)
+        self.fc = nn.Linear(actual_hidden, latent_dim)
 
     def forward(self, x):
-        # x: (batch, 1, 128, 128, 128)
-        features = self.vit(x)  # ViT output: (batch, hidden_size)
+        # x: (batch, C, D, H, W)
+        features = self.vit(x)
+        # MONAI ViT may return a tuple (features, aux) depending on version/config
+        if isinstance(features, tuple):
+            features = features[0]
+        # If features is not a vector, pool it to (batch, hidden_size)
+        if features.dim() > 2:
+            features = features.mean(dim=tuple(range(2, features.dim())))
         z = self.fc(features)   # z: (batch, latent_dim)
         return z
 

@@ -14,6 +14,11 @@ def main():
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory for saving checkpoints")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size for training")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    # Encoder/model options
+    parser.add_argument("--encoder", type=str, default="vit", choices=["vit", "medvit"], help="Encoder backbone")
+    parser.add_argument("--spatial_size", type=int, nargs=3, default=[128,128,128], help="Input volume size D H W after resize")
+    parser.add_argument("--vit_hidden", type=int, default=384, help="ViT hidden size")
+    parser.add_argument("--patch_size", type=int, default=16, help="ViT patch size")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", 
                         help="Device to use for training/inference")
     parser.add_argument("--mixed_precision", action="store_true", help="Use mixed precision training/inference")
@@ -23,6 +28,7 @@ def main():
     parser.add_argument("--target_phase", type=int, choices=[0, 1, 2, 3], help="Target phase (0: arterial, 1: venous, 2: delayed, 3: non-contrast)")
     parser.add_argument("--output_path", type=str, help="Path to save generated volume")
     parser.add_argument("--apply_registration", action="store_true", help="Apply registration to align volumes before training")
+    parser.add_argument("--skip_prep", action="store_true", help="Skip dataset preparation and registration if cached data exists")
     
     args = parser.parse_args()
     
@@ -30,7 +36,8 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
     # Initialize models
-    encoder = Encoder(input_shape=(128, 128, 128, 1), latent_dim=256)
+    img_size = tuple(args.spatial_size)
+    encoder = Encoder(img_size=img_size, vit_hidden_size=args.vit_hidden, latent_dim=256, patch_size=args.patch_size)
     generator = Generator(latent_dim=256, phase_dim=32, output_shape=(128, 128, 128, 1))
     discriminator = Discriminator(input_shape=(128, 128, 128, 1))
     phase_detector = PhaseDetector(latent_dim=256, num_phases=4)
@@ -52,7 +59,8 @@ def main():
             args.data_path,
             labels_csv,
             validation_split=0.2,
-            apply_registration=args.apply_registration  # Pass the registration argument
+            apply_registration=args.apply_registration,
+            skip_prep=args.skip_prep  # Add this
         )
         
         print(f"Training with {len(train_data_dicts)} samples, validating with {len(val_data_dicts)} samples")
@@ -60,16 +68,34 @@ def main():
             print("Registration applied to align volumes")
         
         # Create data loaders
-        train_loader = prepare_data(train_data_dicts, batch_size=args.batch_size)
-        val_loader = prepare_data(val_data_dicts, batch_size=args.batch_size, augmentation=False)
+        train_loader = prepare_data(train_data_dicts, batch_size=args.batch_size, spatial_size=img_size)
+        val_loader = prepare_data(val_data_dicts, batch_size=args.batch_size, augmentation=False, spatial_size=img_size)
         
         # Try to load pre-trained MedViT weights if available
-        medvit_path = "pretrained_medvit.pth"
-        if os.path.exists(medvit_path):
-            print(f"Loading pre-trained MedViT weights from {medvit_path}")
-            encoder.vit.load_state_dict(torch.load(medvit_path))
-        else:
-            print("No pre-trained MedViT weights found. Training from scratch.")
+        if args.encoder == "medvit":
+            medvit_path = "pretrained_medvit.pth"
+            if os.path.exists(medvit_path):
+                print(f"Loading pre-trained MedViT weights from {medvit_path}")
+                state = torch.load(medvit_path, map_location="cpu")
+                if isinstance(state, dict) and any(k in state for k in ["state_dict", "model", "encoder"]):
+                    for k in ["state_dict", "model", "encoder"]:
+                        if k in state:
+                            state = state[k]
+                            break
+                model_state = encoder.vit.state_dict()
+                clean = {}
+                for k, v in state.items():
+                    kk = k
+                    if kk.startswith("module."):
+                        kk = kk[len("module."):]
+                    if kk.startswith("vit.") or kk.startswith("backbone."):
+                        kk = kk.split(".", 1)[1]
+                    if kk in model_state and model_state[kk].shape == v.shape:
+                        clean[kk] = v
+                missing, unexpected = encoder.vit.load_state_dict(clean, strict=False)
+                print("Loaded keys:", len(clean), "Missing:", len(missing), "Unexpected:", len(unexpected))
+            else:
+                print("No pre-trained MedViT weights found. Training ViT from scratch.")
         
         # Train
         print("Starting training...")
