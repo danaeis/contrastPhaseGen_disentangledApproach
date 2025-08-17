@@ -11,14 +11,14 @@ from monai.transforms import (
     RandShiftIntensityd
 )
 
-def prepare_data(data_dicts, batch_size=2, augmentation=True):
+def prepare_data(data_dicts, batch_size=2, augmentation=True, spatial_size=(128,128,128)):
     """Prepare MONAI dataset and DataLoader with optional augmentation."""
     # Basic transforms
     transforms = [
         LoadImaged(keys=["input_volume", "target_volume"]),
         EnsureChannelFirstd(keys=["input_volume", "target_volume"]),
         ScaleIntensityRanged(keys=["input_volume", "target_volume"], a_min=-1000, a_max=1000, b_min=0.0, b_max=1.0),
-        Resized(keys=["input_volume", "target_volume"], spatial_size=(128, 128, 128)),
+        Resized(keys=["input_volume", "target_volume"], spatial_size=spatial_size),
         ToTensord(keys=["input_volume", "target_volume", "input_phase", "target_phase"])
     ]
     
@@ -69,42 +69,73 @@ import nibabel as nib
 import pandas as pd
 from collections import defaultdict
 
-def prepare_dataset_from_folders(data_root, labels_csv, validation_split=0.2, seed=42, apply_registration=False):
-    # First, validate dataset
-    report, pairs_df_path = validate_dataset(data_root, labels_csv)
-    print("Validation Report:")
-    print(report)
-    pairs_df = pd.read_csv(pairs_df_path)
-    # OK till here
-    if 'error' in report:
-        raise ValueError(report['error'])
-    # Check the registration steps
-    if apply_registration:
-        # Apply registration to each scan
-        print("pairs df", pairs_df)
-        for scan_id in pairs_df['scan_id'].unique():
-            scan_dir = os.path.join(data_root, scan_id)
-            output_dir = os.path.join(data_root, f"{scan_id}_registered")
-            print("output dir b4 registeration call", output_dir)
+def prepare_dataset_from_folders(data_root, labels_csv, validation_split=0.2, seed=42, apply_registration=False, skip_prep=False):
+    prepared_csv = os.path.join(data_root, 'prepared_pairs.csv')
+    progress_file = os.path.join(data_root, 'registration_progress.json')
+    
+    if skip_prep and os.path.exists(prepared_csv):
+        print(f"Loading cached prepared pairs from {prepared_csv}")
+        pairs_df = pd.read_csv(prepared_csv)
+    else:
+        report, pairs_df_path = validate_dataset(data_root, labels_csv)
+        print("Validation Report:")
+        print(report)
+        pairs_df = pd.read_csv(pairs_df_path)
+        if 'error' in report:
+            raise ValueError(report['error'])
+        
+        if apply_registration:
+            import json
+            completed_scans = []
+            if os.path.exists(progress_file):
+                with open(progress_file, 'r') as f:
+                    completed_scans = json.load(f)
+            print(f"Resuming registration. Completed: {len(completed_scans)} scans")
             
-            row = pairs_df[(pairs_df['scan_id'] == scan_id) & (pairs_df['input_phase'] == 'Non-contrast')]
-            nc_path = ''
-            if not row.empty:
-                nc_path = row.iloc[0]['input_path']
-            else:
-                # If not in input_phase, check target_phase
-                row = pairs_df[(pairs_df['scan_id'] == scan_id) & (pairs_df['target_phase'] == 'Non-contrast')]
+            all_scans = pairs_df['scan_id'].unique()
+            remaining_scans = [s for s in all_scans if s not in completed_scans]
+            
+            for scan_id in remaining_scans:
+                scan_dir = os.path.join(data_root, scan_id)
+                output_dir = os.path.join(data_root, f"{scan_id}_registered")
+                row = pairs_df[(pairs_df['scan_id'] == scan_id) & (pairs_df['input_phase'] == 'Non-contrast')]
+                nc_path = ''
                 if not row.empty:
-                    nc_path = row.iloc[0]['target_path']
+                    nc_path = row.iloc[0]['input_path']
+                else:
+                    row = pairs_df[(pairs_df['scan_id'] == scan_id) & (pairs_df['target_phase'] == 'Non-contrast')]
+                    if not row.empty:
+                        nc_path = row.iloc[0]['target_path']
+                register_case_series(scan_dir, output_dir, nc_path)
+                # Update paths to match actual registered filenames
+                # Registered files are saved as: output_dir / ("registered_" + original_filename)
+                # Build new paths using basename to avoid incorrect string replacements
+                pairs_df.loc[pairs_df['scan_id'] == scan_id, 'input_path'] = (
+                    pairs_df.loc[pairs_df['scan_id'] == scan_id, 'input_path']
+                    .apply(lambda p: os.path.join(output_dir, f"registered_{os.path.basename(p)}"))
+                )
+                pairs_df.loc[pairs_df['scan_id'] == scan_id, 'target_path'] = (
+                    pairs_df.loc[pairs_df['scan_id'] == scan_id, 'target_path']
+                    .apply(lambda p: os.path.join(output_dir, f"registered_{os.path.basename(p)}"))
+                )
+                # Mark as completed
+                completed_scans.append(scan_id)
+                with open(progress_file, 'w') as f:
+                    json.dump(completed_scans, f)
+                print(f"Completed registration for {scan_id}. Progress saved.")
             
-            register_case_series(scan_dir, output_dir, nc_path)
-            # Update paths in pairs_df to registered versions
-            pairs_df.loc[pairs_df['scan_id'] == scan_id, 'input_path'] = pairs_df['input_path'].apply(
-                lambda p: p.replace(scan_dir, output_dir).replace('.nii.gz', '_registered.nii.gz')
-            )
-            pairs_df.loc[pairs_df['scan_id'] == scan_id, 'target_path'] = pairs_df['target_path'].apply(
-                lambda p: p.replace(scan_dir, output_dir).replace('.nii.gz', '_registered.nii.gz')
-            )
+            # Clean up progress file after completion
+            if len(remaining_scans) == 0:
+                print("All registrations complete.")
+            else:
+                print(f"Registered {len(remaining_scans)} remaining scans.")
+        
+        # Save the prepared pairs
+        pairs_df.to_csv(prepared_csv, index=False)
+        print(f"Saved prepared pairs to {prepared_csv}")
+        # Optional: Remove progress file if all done
+        if apply_registration and os.path.exists(progress_file):
+            os.remove(progress_file)
     
     # Create data_dicts from pairs_df
     data_dicts = []
@@ -144,7 +175,9 @@ def register_case_series(scan_dir, output_dir, non_contrast_file='non_contrast.n
     
     fixed = sitk.ReadImage(non_contrast_file)
     
-    nifti_files = [f for f in os.listdir(scan_dir) if f.endswith('.nii.gz') and f != non_contrast_file]
+    # Work with basename to properly exclude the non-contrast file from registration
+    nc_basename = os.path.basename(non_contrast_file)
+    nifti_files = [f for f in os.listdir(scan_dir) if f.endswith('.nii.gz') and f != nc_basename]
     
     for moving_file in nifti_files:
         moving_path = os.path.join(scan_dir, moving_file)
@@ -166,7 +199,7 @@ def register_case_series(scan_dir, output_dir, non_contrast_file='non_contrast.n
     
     # Copy non-contrast as is
     import shutil
-    non_contrast_seriesid = non_contrast_file.split('/')[-1]
+    non_contrast_seriesid = os.path.basename(non_contrast_file)
     shutil.copy(non_contrast_file, os.path.join(output_dir, non_contrast_seriesid))
 
 def validate_dataset(data_folders, labels_csv, output_csv='dataset_pairs.csv'):
@@ -181,7 +214,18 @@ def validate_dataset(data_folders, labels_csv, output_csv='dataset_pairs.csv'):
             return report, None
             
         labels_df = pd.read_csv(labels_csv)
-        phase_map = {'NC': 0, 'A': 1, 'PV': 2, 'D': 3}  # Adjust as per your phases
+        # Robust phase normalization -> integer ids (0: NC, 1: A, 2: PV, 3: D)
+        def phase_to_id(label):
+            s = str(label).strip().lower()
+            if s in {"nc", "non-contrast", "non contrast", "noncontrast"}:
+                return 0
+            if s in {"a", "arterial", "aterial"}:  # include possible typo 'aterial'
+                return 1
+            if s in {"pv", "venous", "portal venous", "portal-venous", "portal_venous"}:
+                return 2
+            if s in {"d", "delayed", "delay"}:
+                return 3
+            return label
         available_phases = {'Non-contrast', 'Aterial', 'Venous'}
         # Organize files by scan_id
         scan_files = defaultdict(dict)
@@ -198,6 +242,8 @@ def validate_dataset(data_folders, labels_csv, output_csv='dataset_pairs.csv'):
                                 series_id = series_file[: -len(p)]
                                 break
                         # print(series_id)
+                        if 'registered' in series_id:
+                            continue
                         phase_arr = labels_df[labels_df['SeriesInstanceUID'] == series_id]['Label'].values
                         if len(phase_arr) == 0:
                             print(f"Warning: No phase found for series_id: {series_id}")
@@ -226,17 +272,17 @@ def validate_dataset(data_folders, labels_csv, output_csv='dataset_pairs.csv'):
                             nib.load(target_path)
                             # valid_pairs.append((input_path, target_path, input_phase, target_phase))
                             valid_pairs.append([
-                                input_path, 
-                                target_path, 
-                                phase_map.get(input_phase, input_phase), 
-                                phase_map.get(target_phase, target_phase),
+                                input_path,
+                                target_path,
+                                phase_to_id(input_phase),
+                                phase_to_id(target_phase),
                                 scan_id
                             ])
                         except Exception as e:
                             print(f"Error loading files for {scan_id} ({input_phase} -> {target_phase}): {e}")
         
       
-        # Save to CSV
+        # Save to CSV (ensure integer phase ids)
         with open(output_csv, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['input_path', 'target_path', 'input_phase', 'target_phase', 'scan_id'])

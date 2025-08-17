@@ -1,29 +1,314 @@
 import torch
 import torch.nn as nn
-from monai.networks.nets import ViT as MedViT
+import torch.nn.functional as F
 
-# Encoder: MedViT-like 3D Vision Transformer
-class Encoder(nn.Module):
-    def __init__(self, input_shape=(128, 128, 128, 1), latent_dim=256):
+class Simple3DCNNEncoder(nn.Module):
+    """Simple 3D CNN encoder - no external dependencies"""
+    
+    def __init__(self, in_channels=1, latent_dim=256, img_size=(128, 128, 128)):
         super().__init__()
-        # MedViT configuration: adjust patch_size and hidden_size for A100-40GB
-        self.vit = MedViT(
-            in_channels=1,
-            img_size=input_shape[:-1],
-            patch_size=16,
-            hidden_size=384,  # Reduced for memory efficiency
-            mlp_dim=1536,
-            num_heads=12,
-            num_layers=12,
-            classification=False
+        
+        self.encoder = nn.Sequential(
+            # First block: 128 -> 64
+            nn.Conv3d(in_channels, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True),
+            
+            # Second block: 64 -> 32
+            nn.Conv3d(32, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(64),
+            nn.ReLU(inplace=True),
+            
+            # Third block: 32 -> 16
+            nn.Conv3d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(128),
+            nn.ReLU(inplace=True),
+            
+            # Fourth block: 16 -> 8
+            nn.Conv3d(128, 256, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(256),
+            nn.ReLU(inplace=True),
+            
+            # Fifth block: 8 -> 4
+            nn.Conv3d(256, 512, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(512),
+            nn.ReLU(inplace=True),
+            
+            # Global average pooling
+            nn.AdaptiveAvgPool3d(1)
         )
-        self.fc = nn.Linear(384, latent_dim)  # Map ViT output to latent_dim
-
+        
+        self.fc = nn.Linear(512, latent_dim)
+        
     def forward(self, x):
         # x: (batch, 1, 128, 128, 128)
-        features = self.vit(x)  # ViT output: (batch, hidden_size)
-        z = self.fc(features)   # z: (batch, latent_dim)
+        features = self.encoder(x)  # (batch, 512, 1, 1, 1)
+        features = features.view(features.size(0), -1)  # (batch, 512)
+        z = self.fc(features)  # (batch, latent_dim)
         return z
+
+
+# Option 2: Use timm ViT with 2D slice processing
+class TimmViTEncoder(nn.Module):
+    """Use timm ViT with slice-by-slice processing"""
+    
+    def __init__(self, latent_dim=256, model_name='vit_small_patch16_224', pretrained=True):
+        super().__init__()
+        
+        import timm
+        
+        # Create 2D ViT
+        self.vit = timm.create_model(
+            model_name, 
+            pretrained=pretrained, 
+            num_classes=0,  # Remove classification head
+            global_pool=''  # Remove global pooling
+        )
+        
+        # Get ViT feature dimension
+        with torch.no_grad():
+            dummy = torch.randn(1, 3, 224, 224)
+            features = self.vit(dummy)
+            if features.dim() > 2:
+                features = features.mean(dim=1)  # Average over patches
+            vit_dim = features.shape[-1]
+        
+        # Projection layers
+        self.slice_projection = nn.Linear(vit_dim, latent_dim)
+        
+        # Aggregation across slices
+        self.slice_aggregator = nn.LSTM(
+            latent_dim, latent_dim, 
+            batch_first=True, bidirectional=True
+        )
+        self.final_projection = nn.Linear(latent_dim * 2, latent_dim)
+        
+        self.max_slices = 32  # Limit number of slices
+        
+    def forward(self, volume_3d):
+        # volume_3d: (batch, 1, D, H, W)
+        batch_size, _, depth, height, width = volume_3d.shape
+        
+        # Sample slices if too many
+        if depth > self.max_slices:
+            slice_indices = torch.linspace(0, depth-1, self.max_slices).long()
+        else:
+            slice_indices = torch.arange(depth)
+        
+        slice_features = []
+        
+        for idx in slice_indices:
+            # Extract slice: (batch, 1, H, W)
+            slice_2d = volume_3d[:, :, idx, :, :]
+            
+            # Resize to 224x224 for ViT
+            slice_2d = F.interpolate(
+                slice_2d, size=(224, 224), 
+                mode='bilinear', align_corners=False
+            )
+            
+            # Convert to 3-channel (RGB)
+            slice_2d = slice_2d.repeat(1, 3, 1, 1)
+            
+            # Get ViT features
+            features = self.vit(slice_2d)
+            if features.dim() > 2:
+                features = features.mean(dim=1)  # Average over patches
+            
+            # Project to latent space
+            slice_latent = self.slice_projection(features)
+            slice_features.append(slice_latent)
+        
+        # Stack and aggregate
+        volume_features = torch.stack(slice_features, dim=1)  # (batch, slices, latent_dim)
+        
+        # LSTM aggregation
+        lstm_out, (hidden, _) = self.slice_aggregator(volume_features)
+        final_features = self.final_projection(hidden.view(batch_size, -1))
+        
+        return final_features
+
+
+# Option 3: ResNet3D-based encoder
+class ResNet3DEncoder(nn.Module):
+    """3D ResNet-based encoder using torchvision's ResNet architecture adapted to 3D"""
+    
+    def __init__(self, latent_dim=256, in_channels=1):
+        super().__init__()
+        
+        # Define 3D ResNet blocks
+        self.conv1 = nn.Conv3d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm3d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool3d(kernel_size=3, stride=2, padding=1)
+        
+        # ResNet layers
+        self.layer1 = self._make_layer(64, 64, 2, stride=1)
+        self.layer2 = self._make_layer(64, 128, 2, stride=2)
+        self.layer3 = self._make_layer(128, 256, 2, stride=2)
+        self.layer4 = self._make_layer(256, 512, 2, stride=2)
+        
+        self.avgpool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.fc = nn.Linear(512, latent_dim)
+        
+    def _make_layer(self, in_channels, out_channels, blocks, stride=1):
+        layers = []
+        
+        # First block with potential stride
+        layers.append(BasicBlock3D(in_channels, out_channels, stride))
+        
+        # Remaining blocks
+        for _ in range(1, blocks):
+            layers.append(BasicBlock3D(out_channels, out_channels, 1))
+            
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        
+        return x
+
+
+class BasicBlock3D(nn.Module):
+    """3D version of ResNet BasicBlock"""
+    
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm3d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm3d(out_channels)
+        
+        # Shortcut connection
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm3d(out_channels)
+            )
+    
+    def forward(self, x):
+        residual = self.shortcut(x)
+        
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        out += residual
+        out = self.relu(out)
+        
+        return out
+
+
+# Option 4: Hybrid CNN-Transformer (lightweight)
+class LightweightHybridEncoder(nn.Module):
+    """Lightweight hybrid CNN + self-attention encoder"""
+    
+    def __init__(self, latent_dim=256, in_channels=1):
+        super().__init__()
+        
+        # CNN feature extractor
+        self.cnn_features = nn.Sequential(
+            nn.Conv3d(in_channels, 32, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm3d(32),
+            nn.ReLU(),
+            
+            nn.Conv3d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm3d(64),
+            nn.ReLU(),
+            
+            nn.Conv3d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm3d(128),
+            nn.ReLU(),
+            
+            nn.Conv3d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm3d(256),
+            nn.ReLU(),
+        )
+        
+        # Self-attention for global context
+        self.attention = nn.MultiheadAttention(
+            embed_dim=256, num_heads=8, batch_first=True
+        )
+        
+        # Final projection
+        self.global_pool = nn.AdaptiveAvgPool3d(1)
+        self.fc = nn.Linear(256, latent_dim)
+        
+    def forward(self, x):
+        # CNN features: (batch, 256, 8, 8, 8)
+        features = self.cnn_features(x)
+        
+        # Reshape for attention: (batch, 512, 256)
+        batch_size, channels, d, h, w = features.shape
+        features_flat = features.view(batch_size, channels, -1).transpose(1, 2)
+        
+        # Self-attention
+        attn_out, _ = self.attention(features_flat, features_flat, features_flat)
+        
+        # Reshape back and pool
+        attn_out = attn_out.transpose(1, 2).view(batch_size, channels, d, h, w)
+        pooled = self.global_pool(attn_out)
+        
+        # Final projection
+        output = self.fc(pooled.view(batch_size, -1))
+        
+        return output
+
+
+def create_encoder(encoder_type='simple_cnn', latent_dim=256, **kwargs):
+    """Factory function to create encoders without MONAI dependency"""
+    
+    if encoder_type == 'simple_cnn':
+        return Simple3DCNNEncoder(latent_dim=latent_dim, **kwargs)
+    
+    elif encoder_type == 'timm_vit':
+        return TimmViTEncoder(latent_dim=latent_dim, **kwargs)
+    
+    elif encoder_type == 'resnet3d':
+        return ResNet3DEncoder(latent_dim=latent_dim, **kwargs)
+    
+    elif encoder_type == 'hybrid':
+        return LightweightHybridEncoder(latent_dim=latent_dim, **kwargs)
+    
+    else:
+        raise ValueError(f"Unknown encoder type: {encoder_type}")
+
+# if __name__ == "__main__":
+#     # Test different encoders
+#     encoders = {
+#         'simple_cnn': Simple3DCNNEncoder(latent_dim=256),
+#         'timm_vit': TimmViTEncoder(latent_dim=256),
+#         'resnet3d': ResNet3DEncoder(latent_dim=256),
+#         'hybrid': LightweightHybridEncoder(latent_dim=256)
+#     }
+    
+#     dummy_input = torch.randn(2, 1, 128, 128, 128)
+    
+#     for name, encoder in encoders.items():
+#         try:
+#             output = encoder(dummy_input)
+#             print(f"{name}: Input {dummy_input.shape} -> Output {output.shape}")
+#         except Exception as e:
+#             print(f"{name}: Error - {e}")
+
 
 # Generator: 3D Deconvolutional Network
 class Generator(nn.Module):

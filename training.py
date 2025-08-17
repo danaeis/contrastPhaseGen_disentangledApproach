@@ -2,10 +2,37 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import os
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from utils import GradientReversalLayer, get_phase_embedding
 import numpy as np
 from tqdm import tqdm
+
+def create_phase_embeddings(phase_labels, dim=32, device='cuda'):
+    """
+    Create phase embeddings for a batch of phase labels
+    
+    Args:
+        phase_labels (torch.Tensor): Batch of phase labels
+        dim (int): Embedding dimension  
+        device (str or torch.device): Target device
+    
+    Returns:
+        torch.Tensor: Batch of phase embeddings (batch_size, dim)
+    """
+    batch_embeddings = []
+    
+    for phase_label in phase_labels:
+        # Extract scalar value if tensor
+        if isinstance(phase_label, torch.Tensor):
+            phase_val = phase_label.item()
+        else:
+            phase_val = phase_label
+            
+        # Create embedding on correct device
+        embedding = get_phase_embedding(phase_val, dim=dim, device=device)
+        batch_embeddings.append(embedding)
+    
+    return torch.stack(batch_embeddings)
 
 def train_contrast_phase_generation(
     data_loader,
@@ -17,7 +44,8 @@ def train_contrast_phase_generation(
     device="cuda",
     checkpoint_dir="checkpoints",
     use_mixed_precision=True,
-    validation_loader=None
+    validation_loader=None,
+    encoder_config=None  # Add this parameter
 ):
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -96,9 +124,12 @@ def train_contrast_phase_generation(
                 # Pre-train phase detector
                 optimizer_phase.zero_grad()
                 
-                with autocast(enabled=use_mixed_precision):
+                with autocast(device_type="cuda", enabled=use_mixed_precision):
                     z = encoder(input_volume)
                     phase_pred = phase_detector(z)
+                    # print(f"Phase embedding shape: {phase_emb.shape}")
+                    # print(f"Encoder output shape: {z.shape}")
+                    # print(f"Generator input shape: {z.shape} + {phase_emb.shape}")
                     p_loss = phase_loss(phase_pred, true_phase_label)
                 
                 if use_mixed_precision:
@@ -120,10 +151,14 @@ def train_contrast_phase_generation(
                 optimizer_enc_gen.zero_grad()
                 optimizer_disc.zero_grad()
                 
-                with autocast(enabled=use_mixed_precision):
+                with autocast(device_type="cuda", enabled=use_mixed_precision):
                     # Forward pass
                     z = encoder(input_volume)
-                    phase_emb = torch.stack([get_phase_embedding(p, dim=32).to(device) for p in phase_label])
+                    # phase_emb = torch.stack([get_phase_embedding(p, dim=32).to(device) for p in phase_label])
+                    phase_emb = create_phase_embeddings(phase_label, dim=32, device=device)
+                    # print(f"Phase embedding shape: {phase_emb.shape}")
+                    # print(f"Encoder output shape: {z.shape}")
+                    # print(f"Generator input shape: {z.shape} + {phase_emb.shape}")
                     generated_volume = generator(z, phase_emb)
                     
                     # Discriminator outputs
@@ -146,7 +181,7 @@ def train_contrast_phase_generation(
                 # Generator forward pass (need to recompute fake_score since we detached earlier)
                 optimizer_enc_gen.zero_grad()
                 
-                with autocast(enabled=use_mixed_precision):
+                with autocast(device_type="cuda", enabled=use_mixed_precision):
                     fake_score = discriminator(generated_volume)
                     
                     # Generator loss (L1 + GAN)
@@ -170,7 +205,7 @@ def train_contrast_phase_generation(
                 # Train phase detector with reverse gradient
                 optimizer_phase.zero_grad()
                 
-                with autocast(enabled=use_mixed_precision):
+                with autocast(device_type="cuda", enabled=use_mixed_precision):
                     z = encoder(input_volume)
                     z_reversed = GradientReversalLayer.apply(z, lambda_)
                     phase_pred = phase_detector(z_reversed)
@@ -216,7 +251,8 @@ def train_contrast_phase_generation(
                 'optimizer_enc_gen_state_dict': optimizer_enc_gen.state_dict(),
                 'optimizer_disc_state_dict': optimizer_disc.state_dict(),
                 'optimizer_phase_state_dict': optimizer_phase.state_dict(),
-                'metrics': metrics
+                'metrics': metrics,
+                'encoder_config': encoder_config 
             }, os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth"))
             
             # Save individual model weights for easier loading
@@ -244,7 +280,12 @@ def train_contrast_phase_generation(
                     
                     # Forward pass
                     z = encoder(input_volume)
-                    phase_emb = torch.stack([get_phase_embedding(p, dim=32).to(device) for p in phase_label])
+                    # phase_emb = torch.stack([get_phase_embedding(p, dim=32).to(device) for p in phase_label])
+                    # print(f"Encoder output shape: {z.shape}")
+                    phase_emb = create_phase_embeddings(phase_label, dim=32, device=device)
+                    # print(f"Phase embedding shape: {phase_emb.shape}")
+                    # print(f"Encoder output shape: {z.shape}")
+                    # print(f"Generator input shape: {z.shape} + {phase_emb.shape}")
                     generated_volume = generator(z, phase_emb)
                     phase_pred = phase_detector(z)
                     
