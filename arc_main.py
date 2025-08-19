@@ -3,7 +3,7 @@ import argparse
 import os
 from models import Simple3DCNNEncoder, TimmViTEncoder, ResNet3DEncoder, LightweightHybridEncoder, Generator, Discriminator, PhaseDetector
 from data import prepare_data, prepare_dataset_from_folders
-from training import train_contrast_phase_generation  # Updated training function
+from training import train_contrast_phase_generation
 from inference import benchmark_inference, generate_contrast_phase, save_volume
 from medViT_encoder import create_medvit_encoder
 
@@ -34,12 +34,8 @@ def debug_generator_dimensions(encoder, args):
     
     return encoder_output.shape[-1]
 
-def get_encoder_type_from_args(args):
-    """Determine encoder type from arguments"""
-    return args.encoder
-
 def main():
-    parser = argparse.ArgumentParser(description="CT Contrast Phase Generation Pipeline - Optimized Sequential Training")
+    parser = argparse.ArgumentParser(description="CT Contrast Phase Generation Pipeline")
     parser.add_argument("--mode", type=str, default="train", choices=["train", "inference", "benchmark"], 
                         help="Mode: train, inference, or benchmark")
     parser.add_argument("--data_path", type=str, default="data", help="Path to data directory")
@@ -48,14 +44,11 @@ def main():
     parser.add_argument("--epochs", type=int, default=150, help="Number of training epochs")
     
     # Encoder/model options
-    parser.add_argument("--encoder", type=str, default="medvit", 
-                        choices=["simple_cnn", "timm_vit", "resnet3d", "medvit", "hybrid"], 
-                        help="Encoder backbone")
-    parser.add_argument("--spatial_size", type=int, nargs=3, default=[128,128,128], 
-                        help="Input volume size D H W after resize")
+    parser.add_argument("--encoder", type=str, default="medvit", choices=["simple_cnn", "hybrid", "resnet3d", "timm_vit", "medvit"], help="Encoder backbone")
+    parser.add_argument("--spatial_size", type=int, nargs=3, default=[128,128,128], help="Input volume size D H W after resize")
     parser.add_argument("--vit_hidden", type=int, default=384, help="ViT hidden size")
     parser.add_argument("--patch_size", type=int, default=16, help="ViT patch size")
-    parser.add_argument("--latent_dim", type=int, default=256, help="Latent dimension size")
+    parser.add_argument("--latent_dim", type=int, default=256, help="Latent dimension size")  # Fixed: Added missing latent_dim
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", 
                         help="Device to use for training/inference")
     parser.add_argument("--mixed_precision", action="store_true", help="Use mixed precision training/inference")
@@ -84,11 +77,6 @@ def main():
     parser.add_argument('--timm_model_name', type=str, default='vit_small_patch16_224', help='Timm ViT model name')
     parser.add_argument('--timm_pretrained', action='store_true', help='Use pretrained weights for Timm model')
     
-    # Training phase control arguments
-    parser.add_argument('--force_encoder_pretrain', action='store_true', help='Force encoder pretraining even for pretrained models')
-    parser.add_argument('--skip_phase_detector', action='store_true', help='Skip phase detector training (use if already trained)')
-    parser.add_argument('--resume_from_checkpoint', type=str, help='Resume training from specific checkpoint')
-    
     args = parser.parse_args()
     
     # Create checkpoint directory if it doesn't exist
@@ -96,13 +84,13 @@ def main():
     
     if args.mode == "train":
         # Prepare data
-        print("🔄 Preparing data...")
+        print("Preparing data...")
         
         # Path to labels.csv
         labels_csv = os.path.join(args.data_path, "labels.csv")
         
         if not os.path.exists(labels_csv):
-            print(f"❌ Error: labels.csv not found at {labels_csv}")
+            print(f"Error: labels.csv not found at {labels_csv}")
             return
         
         # Prepare dataset from folders
@@ -114,9 +102,9 @@ def main():
             skip_prep=args.skip_prep
         )
         
-        print(f"✅ Training with {len(train_data_dicts)} samples, validating with {len(val_data_dicts)} samples")
+        print(f"Training with {len(train_data_dicts)} samples, validating with {len(val_data_dicts)} samples")
         if args.apply_registration:
-            print("🔧 Registration applied to align volumes")
+            print("Registration applied to align volumes")
         
         # Fixed: Correct spatial_size usage
         img_size = tuple(args.spatial_size)
@@ -125,9 +113,10 @@ def main():
         train_loader = prepare_data(train_data_dicts, batch_size=args.batch_size, spatial_size=img_size)
         val_loader = prepare_data(val_data_dicts, batch_size=args.batch_size, augmentation=False, spatial_size=img_size)
         
+        
         # Initialize encoder based on choice
-        print(f"🏗️  Initializing {args.encoder} encoder...")
-        encoder_type = get_encoder_type_from_args(args)
+        print(f"Initializing {args.encoder} encoder...")
+        
         encoder_config_for_save = None
         
         if args.encoder == "medvit":
@@ -137,16 +126,15 @@ def main():
                 'pretrained_path': args.medvit_pretrained_path,
                 'latent_dim': args.latent_dim,
                 'aggregation_method': args.aggregation_method,
-                'slice_sampling': args.slice_sampling,
-                'max_slices': args.max_slices
+                'slice_sampling': args.slice_sampling
             }
             
             # Check if pretrained weights exist
             if os.path.exists(args.medvit_pretrained_path):
-                print(f"✅ Using pretrained MedViT weights from {args.medvit_pretrained_path}")
+                print(f"Using pretrained MedViT weights from {args.medvit_pretrained_path}")
             else:
-                print(f"⚠️  Warning: Pretrained weights not found at {args.medvit_pretrained_path}")
-                print("🔄 Training MedViT from scratch...")
+                print(f"Warning: Pretrained weights not found at {args.medvit_pretrained_path}")
+                print("Training MedViT from scratch...")
                 medvit_config['pretrained_path'] = None
             
             encoder = create_medvit_encoder(medvit_config)
@@ -177,23 +165,20 @@ def main():
                     pretrained=args.timm_pretrained,
                     max_slices=128,  # Good balance for large volumes
                     slice_sampling='adaptive' 
-                )
+                )                
                 encoder_config_for_save = {
                     'type': 'timm_vit',
                     'config': {
                         'latent_dim': args.latent_dim,
                         'model_name': args.timm_model_name,
-                        'pretrained': args.timm_pretrained,
-                        'max_slices': 128,
-                        'slice_sampling': 'adaptive'
+                        'pretrained': args.timm_pretrained
                     }
                 }
             except ImportError:
-                print("❌ Error: timm library not found. Install with: pip install timm")
-                print("🔄 Falling back to simple_cnn encoder...")
+                print("Error: timm library not found. Install with: pip install timm")
+                print("Falling back to simple_cnn encoder...")
                 encoder = Simple3DCNNEncoder(in_channels=1, latent_dim=args.latent_dim, img_size=img_size)
                 encoder_config_for_save = {'type': 'simple_cnn', 'config': {'latent_dim': args.latent_dim}}
-                encoder_type = "simple_cnn"
                 
         elif args.encoder == "resnet3d":
             # ResNet3D configuration
@@ -225,41 +210,33 @@ def main():
             
         else:
             raise ValueError(f"Unknown encoder type: {args.encoder}")
+            # print("Initializing standard ViT encoder...")
+            # encoder = Encoder(
+            #     img_size=img_size, 
+            #     vit_hidden_size=args.vit_hidden, 
+            #     latent_dim=args.latent_dim,  # Fixed: Use args.latent_dim instead of hardcoded 256
+            #     patch_size=args.patch_size
+            # )
 
-        # Debug dimensions
-        print("🔍 Debugging generator dimensions...")
-        debug_generator_dimensions(encoder, args)
+        # debug_generator_dimensions(encoder, args)
 
         # Initialize other models with consistent latent dimensions
-        print("🏗️  Initializing Generator, Discriminator, and PhaseDetector...")
+        print("Initializing Generator, Discriminator, and PhaseDetector...")
         generator = Generator(
             latent_dim=args.latent_dim, 
             phase_dim=32, 
-            output_shape=(*img_size, 1)
+            output_shape=(*img_size, 1)  # Fixed: Use img_size instead of hardcoded values
         )
-        discriminator = Discriminator(input_shape=(*img_size, 1))
+        discriminator = Discriminator(input_shape=(*img_size, 1))  # Fixed: Use img_size
         phase_detector = PhaseDetector(latent_dim=args.latent_dim, num_phases=4)
         
-        # Handle resume from checkpoint
-        start_epoch = 0
-        if args.resume_from_checkpoint:
-            print(f"🔄 Resuming from checkpoint: {args.resume_from_checkpoint}")
-            checkpoint = torch.load(args.resume_from_checkpoint, map_location=args.device)
-            
-            # Load model states
-            encoder.load_state_dict(checkpoint['encoder_state_dict'])
-            generator.load_state_dict(checkpoint['generator_state_dict'])
-            
-            if 'discriminator_state_dict' in checkpoint:
-                discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
-            if 'phase_detector_state_dict' in checkpoint:
-                phase_detector.load_state_dict(checkpoint['phase_detector_state_dict'])
-            
-            start_epoch = checkpoint.get('epoch', 0)
-            print(f"✅ Resumed from epoch {start_epoch}")
+        # # Prepare encoder config for saving (for MedViT compatibility)
+        # encoder_config_for_save = None
+        # if args.encoder == "medvit":
+        #     encoder_config_for_save = medvit_config
         
-        # Train with optimized sequential approach
-        print("🚀 Starting optimized sequential training...")
+        # Train
+        print("Starting training...")
         metrics = train_contrast_phase_generation(
             train_loader,
             encoder,
@@ -271,24 +248,10 @@ def main():
             checkpoint_dir=args.checkpoint_dir,
             use_mixed_precision=args.mixed_precision,
             validation_loader=val_loader,
-            encoder_config=encoder_config_for_save,
-            encoder_type=encoder_type
+            encoder_config=encoder_config_for_save  # Pass encoder config for saving
         )
         
-        print("🎉 Training complete!")
-        
-        # Print final metrics summary
-        print(f"\n📊 Final Training Summary:")
-        if 'pretrain_losses' in metrics and metrics['pretrain_losses']:
-            print(f"   Final Pretraining Loss: {metrics['pretrain_losses'][-1]:.6f}")
-        if 'phase_accuracies' in metrics and metrics['phase_accuracies']:
-            print(f"   Phase Detector Accuracy: {metrics['phase_accuracies'][-1]:.4f}")
-        if 'g_losses' in metrics and metrics['g_losses']:
-            print(f"   Final Generator Loss: {metrics['g_losses'][-1]:.6f}")
-        if 'val_metrics' in metrics and metrics['val_metrics']:
-            val_metrics = metrics['val_metrics']
-            print(f"   Validation Reconstruction Loss: {val_metrics['reconstruction_loss']:.6f}")
-            print(f"   Validation Phase Accuracy: {val_metrics['phase_accuracy']:.4f}")
+        print("Training complete!")
         
     elif args.mode == "inference":
         # Validate required arguments
@@ -302,19 +265,20 @@ def main():
         
         for arg_name, arg_value in required_args:
             if arg_value is None:
-                print(f"❌ Error: --{arg_name} must be specified for inference mode")
+                print(f"Error: --{arg_name} must be specified for inference mode")
                 return
         
-        print(f"🔄 Loading checkpoint from {args.checkpoint}")
+        print(f"Loading checkpoint from {args.checkpoint}")
         checkpoint = torch.load(args.checkpoint, map_location=args.device)
         
+        # Determine encoder type and create encoder
         # Determine encoder type and create encoder
         if 'encoder_config' in checkpoint and checkpoint['encoder_config'] is not None:
             encoder_info = checkpoint['encoder_config']
             encoder_type = encoder_info['type']
             encoder_config = encoder_info['config']
             
-            print(f"🏗️  Loading {encoder_type} encoder from checkpoint...")
+            print(f"Loading {encoder_type} encoder from checkpoint...")
             
             if encoder_type == 'medvit':
                 encoder = create_medvit_encoder(encoder_config)
@@ -331,18 +295,19 @@ def main():
                 
         else:
             # Fallback to simple CNN if no encoder config
-            print("⚠️  No encoder config found in checkpoint, using simple CNN...")
+            print("No encoder config found in checkpoint, using simple CNN...")
             img_size = tuple(args.spatial_size)
             encoder = Simple3DCNNEncoder(
                 in_channels=1,
                 latent_dim=args.latent_dim,
                 img_size=img_size
             )
+      
         
         # Initialize generator
         img_size = tuple(args.spatial_size)
         generator = Generator(
-            latent_dim=args.latent_dim,
+            latent_dim=args.latent_dim + 32,
             phase_dim=32, 
             output_shape=(*img_size, 1)
         )
@@ -351,12 +316,12 @@ def main():
         try:
             encoder.load_state_dict(checkpoint['encoder_state_dict'])
             generator.load_state_dict(checkpoint['generator_state_dict'])
-            print("✅ Loaded encoder and generator from checkpoint")
+            print("Loaded encoder and generator from checkpoint")
         except KeyError:
-            print("❌ Error: Checkpoint format not recognized")
+            print("Error: Checkpoint format not recognized")
             return
         except Exception as e:
-            print(f"❌ Error loading model weights: {e}")
+            print(f"Error loading model weights: {e}")
             return
         
         # Move models to device
@@ -366,7 +331,7 @@ def main():
         generator.eval()
         
         # Load and preprocess input volume
-        print(f"🔄 Loading input volume from {args.input_volume}")
+        print(f"Loading input volume from {args.input_volume}")
         try:
             # Try MONAI first, then fallback to alternatives
             try:
@@ -404,12 +369,12 @@ def main():
                     )
                 
         except Exception as e:
-            print(f"❌ Error loading input volume: {e}")
+            print(f"Error loading input volume: {e}")
             return
         
         # Generate contrast phase
         phase_names = ['arterial', 'venous', 'delayed', 'non-contrast']
-        print(f"🔄 Generating {phase_names[args.target_phase]} phase from {phase_names[args.input_phase]} input")
+        print(f"Generating {phase_names[args.target_phase]} phase from {phase_names[args.input_phase]} input")
         
         try:
             generated_volume = generate_contrast_phase(
@@ -423,21 +388,21 @@ def main():
             )
             
             # Save output
-            print(f"💾 Saving generated volume to {args.output_path}")
+            print(f"Saving generated volume to {args.output_path}")
             save_volume(generated_volume, args.output_path)
-            print("✅ Inference complete!")
+            print("Inference complete!")
             
         except Exception as e:
-            print(f"❌ Error during inference: {e}")
+            print(f"Error during inference: {e}")
             return
         
     elif args.mode == "benchmark":
         # Similar to inference but for benchmarking
         if not args.checkpoint:
-            print("❌ Error: --checkpoint must be specified for benchmark mode")
+            print("Error: --checkpoint must be specified for benchmark mode")
             return
         
-        print(f"🔄 Loading checkpoint from {args.checkpoint}")
+        print(f"Loading checkpoint from {args.checkpoint}")
         checkpoint = torch.load(args.checkpoint, map_location=args.device)
         
         # Load encoder (similar to inference)
@@ -464,7 +429,7 @@ def main():
         # Initialize and load generator
         img_size = tuple(args.spatial_size)
         generator = Generator(
-            latent_dim=args.latent_dim,
+            latent_dim=args.latent_dim + 32,
             phase_dim=32, 
             output_shape=(*img_size, 1)
         )
@@ -473,7 +438,7 @@ def main():
             encoder.load_state_dict(checkpoint['encoder_state_dict'])
             generator.load_state_dict(checkpoint['generator_state_dict'])
         except Exception as e:
-            print(f"❌ Error loading model weights: {e}")
+            print(f"Error loading model weights: {e}")
             return
         
         # Move models to device
@@ -481,12 +446,12 @@ def main():
         generator.to(args.device)
         
         # Run benchmark
-        print("🚀 Running inference benchmark...")
+        print("Running inference benchmark...")
         try:
             avg_time = benchmark_inference(encoder, generator, device=args.device)
-            print(f"✅ Benchmark complete! Average inference time: {avg_time*1000:.2f} ms ({1/avg_time:.2f} volumes/second)")
+            print(f"Benchmark complete! Average inference time: {avg_time*1000:.2f} ms ({1/avg_time:.2f} volumes/second)")
         except Exception as e:
-            print(f"❌ Error during benchmark: {e}")
+            print(f"Error during benchmark: {e}")
             return
 
 if __name__ == "__main__":

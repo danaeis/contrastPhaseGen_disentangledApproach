@@ -52,7 +52,7 @@ class Simple3DCNNEncoder(nn.Module):
 class TimmViTEncoder(nn.Module):
     """Use timm ViT with slice-by-slice processing"""
     
-    def __init__(self, latent_dim=256, model_name='vit_small_patch16_224', pretrained=True):
+    def __init__(self, latent_dim=256, model_name='vit_small_patch16_224', pretrained=True, max_slices=32, slice_sampling='uniform'):
         super().__init__()
         
         import timm
@@ -83,17 +83,28 @@ class TimmViTEncoder(nn.Module):
         )
         self.final_projection = nn.Linear(latent_dim * 2, latent_dim)
         
-        self.max_slices = 32  # Limit number of slices
+        self.max_slices = max_slices  # Limit number of slices
+        self.slice_sampling = slice_sampling  # Sampling strategy
         
     def forward(self, volume_3d):
         # volume_3d: (batch, 1, D, H, W)
         batch_size, _, depth, height, width = volume_3d.shape
         
-        # Sample slices if too many
-        if depth > self.max_slices:
-            slice_indices = torch.linspace(0, depth-1, self.max_slices).long()
-        else:
+        # Select slice indices based on sampling method
+        if self.slice_sampling == 'all':
             slice_indices = torch.arange(depth)
+        elif self.slice_sampling == 'uniform':
+            if depth > self.max_slices:
+                slice_indices = torch.linspace(0, depth-1, self.max_slices).long()
+            else:
+                slice_indices = torch.arange(depth)
+        elif self.slice_sampling == 'adaptive':
+            # Example adaptive sampling: more slices in the center
+            center = depth // 2
+            indices = torch.linspace(center - self.max_slices//2, center + self.max_slices//2, self.max_slices).clamp(0, depth-1).long()
+            slice_indices = torch.unique(indices)  # Remove duplicates if any
+        else:
+            raise ValueError(f"Unknown slice_sampling method: {self.slice_sampling}")
         
         slice_features = []
         

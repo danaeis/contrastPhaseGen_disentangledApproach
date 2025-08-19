@@ -6,11 +6,11 @@ import os
 from pathlib import Path
 
 # Add MedViT to Python path
-medvit_path = Path(__file__).parent / "MedViT"
+medvit_path = Path(__file__).parent 
 sys.path.insert(0, str(medvit_path))
 
 try:
-    from models.MedViT import MedViT
+    import MedViT
 except ImportError:
     print("Warning: Could not import MedViT. Make sure MedViT repository is cloned in the current directory.")
     print("Falling back to a dummy implementation.")
@@ -27,6 +27,11 @@ except ImportError:
             
         def forward(self, x):
             return self.features(x).flatten(1)
+
+try:
+    from MedViT.MedViT import MedViT_small  # Adjusted import for direct file structure
+except ImportError:
+    raise ImportError("Failed to import MedViT. Ensure the MedViT repository is cloned in the project directory and the path is correct.")
 
 
 class MedViTEncoder3D(nn.Module):
@@ -60,7 +65,7 @@ class MedViTEncoder3D(nn.Module):
         
         print(f"Initializing MedViT encoder (size: {model_size}, latent_dim: {latent_dim})")
         
-        # Initialize MedViT backbone
+        # Initialize MedViT backbone without fallback
         self.medvit = self._create_medvit_model(model_size)
         
         # Load pretrained weights if available
@@ -106,147 +111,200 @@ class MedViTEncoder3D(nn.Module):
         
     def _create_medvit_model(self, model_size):
         """Create MedViT model based on size with fallback"""
-        try:
-            # Try to create MedViT model with different possible configurations
-            configs = {
-                'tiny': {
-                    'img_size': 224,
-                    'patch_size': 16,
-                    'num_classes': 1000,
-                    'embed_dims': [64, 128, 256, 512],
-                    'num_heads': [1, 2, 4, 8],
-                    'mlp_ratios': [8, 8, 4, 4],
-                    'depths': [2, 2, 2, 2]
-                },
-                'small': {
-                    'img_size': 224,
-                    'patch_size': 16,
-                    'num_classes': 1000,
-                    'embed_dims': [64, 128, 256, 512],
-                    'num_heads': [1, 2, 4, 8],
-                    'mlp_ratios': [8, 8, 4, 4],
-                    'depths': [3, 3, 5, 2]
-                },
-                'base': {
-                    'img_size': 224,
-                    'patch_size': 16,
-                    'num_classes': 1000,
-                    'embed_dims': [96, 192, 384, 768],
-                    'num_heads': [1, 2, 4, 8],
-                    'mlp_ratios': [8, 8, 4, 4],
-                    'depths': [3, 3, 5, 2]
-                }
-            }
+        """Create MedViT model based on size"""
+        if model_size == 'small':
+            return MedViT_small()  # Use the specific constructor from the repo
+        elif model_size == 'base':
+            # Add similar for base if needed
+            pass
+        elif model_size == 'large':
+            # Add similar for large if needed
+            pass
+        else:
+            raise ValueError(f"Unsupported model size: {model_size}")
+
+    #     try:
+    #         # Try to create MedViT model with different possible configurations
+    #         configs = {
+    #             'tiny': {
+    #                 'img_size': 224,
+    #                 'patch_size': 16,
+    #                 'num_classes': 1000,
+    #                 'embed_dims': [64, 128, 256, 512],
+    #                 'num_heads': [1, 2, 4, 8],
+    #                 'mlp_ratios': [8, 8, 4, 4],
+    #                 'depths': [2, 2, 2, 2]
+    #             },
+    #             'small': {
+    #                 'img_size': 224,
+    #                 'patch_size': 16,
+    #                 'num_classes': 1000,
+    #                 'embed_dims': [64, 128, 256, 512],
+    #                 'num_heads': [1, 2, 4, 8],
+    #                 'mlp_ratios': [8, 8, 4, 4],
+    #                 'depths': [3, 3, 5, 2]
+    #             },
+    #             'base': {
+    #                 'img_size': 224,
+    #                 'patch_size': 16,
+    #                 'num_classes': 1000,
+    #                 'embed_dims': [96, 192, 384, 768],
+    #                 'num_heads': [1, 2, 4, 8],
+    #                 'mlp_ratios': [8, 8, 4, 4],
+    #                 'depths': [3, 3, 5, 2]
+    #             }
+    #         }
             
-            config = configs.get(model_size, configs['small'])
+    #         config = configs.get(model_size, configs['small'])
             
-            # Try different MedViT constructor signatures
-            try:
-                return MedViT(**config)
-            except TypeError:
-                # Fallback to simpler constructor
-                return MedViT(
-                    img_size=config['img_size'],
-                    patch_size=config['patch_size'],
-                    num_classes=config['num_classes']
-                )
+    #         # Try different MedViT constructor signatures
+    #         try:
+    #             return MedViT(**config)
+    #         except TypeError:
+    #             # Fallback to simpler constructor
+    #             return MedViT(
+    #                 img_size=config['img_size'],
+    #                 patch_size=config['patch_size'],
+    #                 num_classes=config['num_classes']
+    #             )
                 
-        except Exception as e:
-            print(f"Error creating MedViT: {e}")
-            print("Using fallback CNN model...")
-            return self._create_fallback_model()
+    #     except Exception as e:
+    #         print(f"Error creating MedViT: {e}")
+    #         print("Using fallback CNN model...")
+    #         return self._create_fallback_model()
     
-    def _create_fallback_model(self):
-        """Create a fallback CNN model if MedViT fails"""
-        return nn.Sequential(
-            nn.Conv2d(3, 64, 7, 2, 3),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(64, 512)
-        )
+    # def _create_fallback_model(self):
+    #     """Create a fallback CNN model if MedViT fails"""
+    #     return nn.Sequential(
+    #         nn.Conv2d(3, 64, 7, 2, 3),
+    #         nn.BatchNorm2d(64),
+    #         nn.ReLU(),
+    #         nn.AdaptiveAvgPool2d(1),
+    #         nn.Flatten(),
+    #         nn.Linear(64, 512)
+    #     )
     
     def _get_medvit_feature_dim(self):
+        # """Get the feature dimension of MedViT model"""
+        # self.medvit.eval()
+        # with torch.no_grad():
+            # try:
+            #     dummy_input = torch.randn(1, 3, 224, 224)
+            #     features = self.medvit(dummy_input)
+                
+            #     # Handle different output formats
+            #     if isinstance(features, tuple):
+            #         features = features[0]
+            #     if isinstance(features, dict):
+            #         # Try common keys
+            #         for key in ['features', 'logits', 'out']:
+            #             if key in features:
+            #                 features = features[key]
+            #                 break
+            #         else:
+            #             features = list(features.values())[0]
+                
+            #     # Ensure 2D tensor
+            #     while features.dim() > 2:
+            #         features = features.mean(dim=-1)
+                
+            #     feature_dim = features.shape[-1]
+            #     print(f"Detected MedViT feature dimension: {feature_dim}")
+            #     return feature_dim
+                
+            # except Exception as e:
+            #     print(f"Error detecting feature dimension: {e}")
+            #     return 512  # Fallback dimension
+            # finally:
+            #     self.medvit.train()
         """Get the feature dimension of MedViT model"""
+        original_mode = self.medvit.training
         self.medvit.eval()
-        with torch.no_grad():
-            try:
+        try:
+            with torch.no_grad():
                 dummy_input = torch.randn(1, 3, 224, 224)
                 features = self.medvit(dummy_input)
-                
-                # Handle different output formats
-                if isinstance(features, tuple):
-                    features = features[0]
-                if isinstance(features, dict):
-                    # Try common keys
-                    for key in ['features', 'logits', 'out']:
-                        if key in features:
-                            features = features[key]
-                            break
-                    else:
-                        features = list(features.values())[0]
-                
-                # Ensure 2D tensor
-                while features.dim() > 2:
-                    features = features.mean(dim=-1)
-                
+                # Assuming MedViT outputs features directly
                 feature_dim = features.shape[-1]
                 print(f"Detected MedViT feature dimension: {feature_dim}")
                 return feature_dim
-                
-            except Exception as e:
-                print(f"Error detecting feature dimension: {e}")
-                return 512  # Fallback dimension
         finally:
-            self.medvit.train()
+            self.medvit.train(mode=original_mode)
     
     def _load_pretrained_weights(self, checkpoint_path):
-        """Load pretrained MedViT weights with better error handling"""
-        try:
-            print(f"Loading pretrained weights from {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        # """Load pretrained MedViT weights with better error handling"""
+        # try:
+        #     print(f"Loading pretrained weights from {checkpoint_path}")
+        #     checkpoint = torch.load(checkpoint_path, map_location='cpu')
             
-            # Handle different checkpoint formats
-            if 'model' in checkpoint:
-                state_dict = checkpoint['model']
-            elif 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
-            elif 'model_state_dict' in checkpoint:
-                state_dict = checkpoint['model_state_dict']
-            else:
-                state_dict = checkpoint
+        #     # Handle different checkpoint formats
+        #     if 'model' in checkpoint:
+        #         state_dict = checkpoint['model']
+        #     elif 'state_dict' in checkpoint:
+        #         state_dict = checkpoint['state_dict']
+        #     elif 'model_state_dict' in checkpoint:
+        #         state_dict = checkpoint['model_state_dict']
+        #     else:
+        #         state_dict = checkpoint
             
-            # Get current model state dict
-            model_state_dict = self.medvit.state_dict()
+        #     # Remap keys (common fixes: remove 'module.' or 'backbone.')
+        #     remapped_state_dict = {}
+        #     for key, value in state_dict.items():
+        #         new_key = key
+        #         if new_key.startswith('module.'):
+        #             new_key = new_key[7:]  # Remove 'module.'
+        #         if new_key.startswith('backbone.'):
+        #             new_key = new_key[9:]  # Remove 'backbone.'
+        #         # Add more remaps if needed (inspect checkpoint keys with print(list(state_dict.keys())[:5]))
+        #         remapped_state_dict[new_key] = value
+
+        #     # Get current model state dict
+        #     print("state_dict keys:", list(state_dict.keys())[:10])
+        #     model_state_dict = self.medvit.state_dict()
+        #     print("model_state_dict keys:", list(model_state_dict.keys())[:10])
+
+        #     # Filter compatible weights
+        #     compatible_weights = {}
+        #     incompatible_keys = []
             
-            # Filter compatible weights
-            compatible_weights = {}
-            incompatible_keys = []
+        #     for key, value in state_dict.items():
+        #         if key in model_state_dict:
+        #             if model_state_dict[key].shape == value.shape:
+        #                 compatible_weights[key] = value
+        #             else:
+        #                 incompatible_keys.append(f"{key}: {value.shape} vs {model_state_dict[key].shape}")
+        #         else:
+        #             incompatible_keys.append(f"{key}: not found in model")
             
-            for key, value in state_dict.items():
-                if key in model_state_dict:
-                    if model_state_dict[key].shape == value.shape:
-                        compatible_weights[key] = value
-                    else:
-                        incompatible_keys.append(f"{key}: {value.shape} vs {model_state_dict[key].shape}")
-                else:
-                    incompatible_keys.append(f"{key}: not found in model")
+        #     # Load compatible weights
+        #     missing_keys, unexpected_keys = self.medvit.load_state_dict(compatible_weights, strict=False)
             
-            # Load compatible weights
-            missing_keys, unexpected_keys = self.medvit.load_state_dict(compatible_weights, strict=False)
-            
-            print(f"Loaded {len(compatible_weights)} compatible weights")
-            if missing_keys:
-                print(f"Missing keys: {missing_keys[:5]}...")
-            if unexpected_keys:
-                print(f"Unexpected keys: {unexpected_keys[:5]}...")
-            if incompatible_keys:
-                print(f"Incompatible shapes: {len(incompatible_keys)} keys")
+        #     print(f"Loaded {len(compatible_weights)} compatible weights")
+        #     if missing_keys:
+        #         print(f"Missing keys: {missing_keys[:5]}...")
+        #     if unexpected_keys:
+        #         print(f"Unexpected keys: {unexpected_keys[:5]}...")
+        #     if incompatible_keys:
+        #         print(f"Incompatible shapes: {len(incompatible_keys)} keys")
                 
-        except Exception as e:
-            print(f"Error loading pretrained weights: {e}")
-            print("Continuing with random initialization...")
+        # except Exception as e:
+        #     print(f"Error loading pretrained weights: {e}")
+        #     print("Continuing with random initialization...")
+
+        """Load pretrained MedViT weights with key mapping if needed"""
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        state_dict = checkpoint if 'state_dict' not in checkpoint else checkpoint['state_dict']
+        
+        # If keys don't match directly, add mapping (e.g., remove 'module.' prefix if present)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            name = k.replace('module.', '')  # Adjust based on common mismatches
+            new_state_dict[name] = v
+        
+        missing_keys, unexpected_keys = self.medvit.load_state_dict(new_state_dict, strict=False)
+        print(f"Loaded weights from {checkpoint_path}")
+        print(f"Missing keys: {len(missing_keys)}")
+        print(f"Unexpected keys: {len(unexpected_keys)}")
     
     def _sample_slices(self, volume_3d):
         """Sample slices from 3D volume"""
@@ -306,28 +364,23 @@ class MedViTEncoder3D(nn.Module):
             # Preprocess for MedViT
             slice_2d = self._preprocess_slice(slice_2d)
             
-            # Get features from MedViT
-            try:
-                with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
-                    medvit_features = self.medvit(slice_2d)
-                    
-                    # Handle different output formats
-                    if isinstance(medvit_features, tuple):
-                        medvit_features = medvit_features[0]
-                    if isinstance(medvit_features, dict):
-                        medvit_features = list(medvit_features.values())[0]
-                    
-                    # Ensure correct shape
-                    while medvit_features.dim() > 2:
-                        medvit_features = medvit_features.mean(dim=-1)
-                        
-            except Exception as e:
-                print(f"Error in MedViT forward pass: {e}")
-                # Fallback to zeros
-                medvit_features = torch.zeros(batch_size, 512, device=device)
+            # Get features from MedViT without independent autocast
+            # (rely on outer context or set enabled=False if not using mixed precision)
+            with torch.amp.autocast('cuda', enabled=False):  # Disable here or pass a flag
+                medvit_features = self.medvit(slice_2d)
+                
+                # Handle different output formats
+                if isinstance(medvit_features, tuple):
+                    medvit_features = medvit_features[0]
+                if isinstance(medvit_features, dict):
+                    medvit_features = list(medvit_features.values())[0]
+                
+                # Ensure correct shape
+                while medvit_features.dim() > 2:
+                    medvit_features = medvit_features.mean(dim=-1)
             
-            # Project to latent dimension
-            slice_latent = self.feature_projection(medvit_features)
+            # Project to latent dimension (now dtypes match)
+            slice_latent = self.feature_projection(medvit_features.float())  # Explicit cast if needed
             slice_latent = self.slice_norm(slice_latent)
             
             slice_features.append(slice_latent)
