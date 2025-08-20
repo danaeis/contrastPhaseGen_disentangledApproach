@@ -304,6 +304,7 @@ class MedViTEncoder3D(nn.Module):
         missing_keys, unexpected_keys = self.medvit.load_state_dict(new_state_dict, strict=False)
         print(f"Loaded weights from {checkpoint_path}")
         print(f"Missing keys: {len(missing_keys)}")
+        print("Missing keys:", missing_keys)
         print(f"Unexpected keys: {len(unexpected_keys)}")
     
     def _sample_slices(self, volume_3d):

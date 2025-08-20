@@ -370,16 +370,29 @@ class Discriminator(nn.Module):
     def forward(self, x):
         return self.model(x).view(-1, 1)  # (batch, 1)
 
-# Phase Detector
+
 class PhaseDetector(nn.Module):
     def __init__(self, latent_dim=256, num_phases=4):
-        super().__init__()
+        super().__init__()  # ✅ Call parent class __init__ first
         self.model = nn.Sequential(
-            nn.Linear(latent_dim, 128),
+            nn.Linear(latent_dim, 512),      # Larger capacity
+            nn.BatchNorm1d(512),             # Batch normalization
             nn.ReLU(),
-            nn.Linear(128, num_phases),
-            nn.Softmax(dim=1)
+            nn.Dropout(0.3),                 # Regularization
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, num_phases)       # No softmax (let CrossEntropy handle it)
         )
+        # Initialize weights properly
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
 
     def forward(self, z):
         return self.model(z)  # (batch, num_phases)

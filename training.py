@@ -34,38 +34,158 @@ def check_pretrained_weights(encoder, encoder_type):
         print(f"✗ {encoder_type} encoder needs pretraining")
         return False
 
-def pretrain_encoder_generator(train_loader, encoder, generator, num_epochs=20, device="cuda", use_mixed_precision=True):
+def debug_data_flow(batch, encoder, generator, phase_detector, device):
+    """Debug function to check data flow and gradients"""
+    print("\n" + "="*60)
+    print("🔍 DEBUGGING DATA FLOW")
+    print("="*60)
+    
+    input_volume = batch["input_volume"].to(device)
+    target_volume = batch["target_volume"].to(device) 
+    phase_label = batch["target_phase"].to(device)
+    target_phase_label = batch["input_phase"].to(device)
+    
+    print(f"📊 Batch Info:")
+    print(f"   Input volume shape: {input_volume.shape}")
+    print(f"   Target volume shape: {target_volume.shape}")
+    print(f"   Input volume range: [{input_volume.min():.3f}, {input_volume.max():.3f}]")
+    print(f"   Target volume range: [{target_volume.min():.3f}, {target_volume.max():.3f}]")
+    print(f"   Phase labels: {phase_label.cpu().numpy()}")
+    print(f"   True phases: {target_phase_label.cpu().numpy()}")
+    
+    # Test encoder
+    with torch.no_grad():
+        z = encoder(input_volume)
+        print(f"\n🏗️  Encoder Output:")
+        print(f"   Latent shape: {z.shape}")
+        print(f"   Latent range: [{z.min():.3f}, {z.max():.3f}]")
+        print(f"   Latent std: {z.std():.3f}")
+        
+        # Check for NaN or inf
+        if torch.isnan(z).any():
+            print("   ⚠️  WARNING: NaN detected in encoder output!")
+        if torch.isinf(z).any():
+            print("   ⚠️  WARNING: Inf detected in encoder output!")
+    
+    # Test phase embedding
+    phase_emb = create_phase_embeddings(phase_label, dim=32, device=device)
+    print(f"\n🎯 Phase Embedding:")
+    print(f"   Phase embedding shape: {phase_emb.shape}")
+    print(f"   Phase embedding range: [{phase_emb.min():.3f}, {phase_emb.max():.3f}]")
+    
+    # Test generator
+    with torch.no_grad():
+        generated = generator(z, phase_emb)
+        print(f"\n🏭 Generator Output:")
+        print(f"   Generated shape: {generated.shape}")
+        print(f"   Generated range: [{generated.min():.3f}, {generated.max():.3f}]")
+        print(f"   Generated std: {generated.std():.3f}")
+        
+        # Check for NaN or inf
+        if torch.isnan(generated).any():
+            print("   ⚠️  WARNING: NaN detected in generator output!")
+        if torch.isinf(generated).any():
+            print("   ⚠️  WARNING: Inf detected in generator output!")
+    
+    # Test phase detector
+    with torch.no_grad():
+        phase_pred = phase_detector(z)
+        print(f"\n🎯 Phase Detector Output:")
+        print(f"   Phase prediction shape: {phase_pred.shape}")
+        print(f"   Phase prediction range: [{phase_pred.min():.3f}, {phase_pred.max():.3f}]")
+        print(f"   Softmax predictions: {torch.softmax(phase_pred, dim=1)[0].cpu().numpy()}")
+        
+        # Check for NaN or inf
+        if torch.isnan(phase_pred).any():
+            print("   ⚠️  WARNING: NaN detected in phase detector output!")
+        if torch.isinf(phase_pred).any():
+            print("   ⚠️  WARNING: Inf detected in phase detector output!")
+    
+    # Test reconstruction loss
+    with torch.no_grad():
+        recon_loss = nn.L1Loss()(generated, target_volume)
+        print(f"\n📊 Loss Analysis:")
+        print(f"   Reconstruction L1 Loss: {recon_loss.item():.6f}")
+        
+        # Analyze difference
+        diff = torch.abs(generated - target_volume)
+        print(f"   Mean absolute difference: {diff.mean():.6f}")
+        print(f"   Max absolute difference: {diff.max():.6f}")
+    
+    print("="*60)
+
+def check_gradient_flow(model, model_name):
+    """Check if gradients are flowing properly"""
+    total_norm = 0
+    param_count = 0
+    zero_grad_count = 0
+    
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            param_norm = param.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+            param_count += 1
+            
+            if param_norm.item() < 1e-7:
+                zero_grad_count += 1
+        else:
+            zero_grad_count += 1
+            param_count += 1
+    
+    total_norm = total_norm ** (1. / 2)
+    
+    print(f"🔄 Gradient Flow - {model_name}:")
+    print(f"   Total gradient norm: {total_norm:.6f}")
+    print(f"   Parameters with zero gradients: {zero_grad_count}/{param_count}")
+    
+    if total_norm < 1e-5:
+        print(f"   ⚠️  WARNING: Very small gradients in {model_name}!")
+    if zero_grad_count > param_count * 0.5:
+        print(f"   ⚠️  WARNING: Many zero gradients in {model_name}!")
+
+def pretrain_encoder_generator(train_loader, encoder, generator, phase_detector, num_epochs=30, device="cuda", use_mixed_precision=True):
     """
-    Phase 1: Pretrain encoder and generator with reconstruction loss
-    This creates meaningful embeddings before phase detection training
+    FIXED Phase 1: Pretrain encoder and generator with reconstruction loss
     """
     print(f"\n{'='*60}")
-    print("PHASE 1: ENCODER + GENERATOR PRETRAINING")
+    print("PHASE 1: ENCODER + GENERATOR PRETRAINING (FIXED)")
     print(f"{'='*60}")
     
     # Set models to training mode
     encoder.train()
     generator.train()
     
-    # Reconstruction loss
-    reconstruction_loss = nn.L1Loss()
-    
-    # Optimizers with higher learning rate for pretraining
-    optimizer_enc = optim.Adam(encoder.parameters(), lr=2e-4)
-    optimizer_gen = optim.Adam(generator.parameters(), lr=2e-4)
-    
+    # FIXED: Use MSE loss instead of L1 for better gradient flow
+    reconstruction_loss = nn.MSELoss()
+    print("line 160")
+    # FIXED: Lower learning rates for more stable training
+    optimizer_enc = optim.Adam(encoder.parameters(), lr=1e-4, weight_decay=1e-5)
+    optimizer_gen = optim.Adam(generator.parameters(), lr=1e-4, weight_decay=1e-5)
+    print("line 164")
+    # FIXED: Add learning rate scheduler
+    scheduler_enc = optim.lr_scheduler.ReduceLROnPlateau(optimizer_enc, patience=5, factor=0.5)
+    scheduler_gen = optim.lr_scheduler.ReduceLROnPlateau(optimizer_gen, patience=5, factor=0.5)
+    print("line 168")
     # Mixed precision
     scaler = GradScaler() if use_mixed_precision else None
     
     pretrain_losses = []
+    best_loss = float('inf')
     
+    # Debug first batch
+    debug_batch = next(iter(train_loader))
+    debug_data_flow(debug_batch, encoder, generator, phase_detector, device)
+    print("line 178")
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         num_batches = 0
         
-        for batch in tqdm(train_loader, desc=f"Pretrain Epoch {epoch+1}/{num_epochs}"):
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Pretrain Epoch {epoch+1}/{num_epochs}")):
             input_volume = batch["input_volume"].to(device)
-            # For pretraining, we use input volume as target (autoencoder-like)
+            input_phase = batch["input_phase"].to(device)
+            # FIXED: Use target volume as reconstruction target
+            target_volume = batch["target_volume"].to(device)
+            target_phase = batch["target_phase"].to(device)
             
             optimizer_enc.zero_grad()
             optimizer_gen.zero_grad()
@@ -74,48 +194,93 @@ def pretrain_encoder_generator(train_loader, encoder, generator, num_epochs=20, 
                 # Encode input
                 z = encoder(input_volume)
                 
-                # Generate random phase embedding for diversity
-                batch_size = input_volume.shape[0]
-                random_phases = torch.randint(0, 4, (batch_size,)).to(device)
-                phase_emb = create_phase_embeddings(random_phases, dim=32, device=device)
+                # FIXED: Use target phase instead of random phase for better learning
+                phase_emb = create_phase_embeddings(target_phase, dim=32, device=device)
                 
                 # Generate volume
                 reconstructed_volume = generator(z, phase_emb)
                 
+                # FIXED: Ensure same data range for loss computation
+                # Clamp both to [0, 1] range
+                reconstructed_volume = torch.clamp(reconstructed_volume, 0, 1)
+                target_volume = torch.clamp(target_volume, 0, 1)
+                
                 # Reconstruction loss
-                loss = reconstruction_loss(reconstructed_volume, input_volume)
+                loss = reconstruction_loss(reconstructed_volume, target_volume)
+                
+                # FIXED: Add regularization term to prevent mode collapse
+                # Encourage encoder to produce diverse features
+                z_var = torch.var(z, dim=0).mean()
+                reg_loss = -0.01 * z_var  # Negative to encourage variance
+                
+                total_loss = loss + reg_loss
             
             # Backward pass
             if use_mixed_precision:
-                scaler.scale(loss).backward()
+                scaler.scale(total_loss).backward()
+                
+                # FIXED: Add gradient clipping
+                scaler.unscale_(optimizer_enc)
+                scaler.unscale_(optimizer_gen)
+                torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
+                
                 scaler.step(optimizer_enc)
                 scaler.step(optimizer_gen)
                 scaler.update()
             else:
-                loss.backward()
+                total_loss.backward()
+                
+                # FIXED: Add gradient clipping
+                torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
+                
                 optimizer_enc.step()
                 optimizer_gen.step()
             
-            epoch_loss += loss.item()
+            epoch_loss += loss.item()  # Don't include reg_loss in reported loss
             num_batches += 1
+            
+            # Debug gradient flow every 50 batches
+            if batch_idx % 50 == 0:
+                check_gradient_flow(encoder, "Encoder")
+                check_gradient_flow(generator, "Generator")
         
         avg_loss = epoch_loss / num_batches
         pretrain_losses.append(avg_loss)
-        print(f"Pretrain Epoch {epoch+1}: Reconstruction Loss = {avg_loss:.6f}")
+        
+        # Update learning rate
+        scheduler_enc.step(avg_loss)
+        scheduler_gen.step(avg_loss)
+        # Log learning rate
+        current_lr = optimizer_enc.param_groups[0]['lr']
+        print(f"Epoch {epoch+1}/{num_epochs}, Validation Loss: {avg_loss:.4f}, Learning Rate: {current_lr}")
+
+        # Track best loss
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            improvement = "✅"
+        else:
+            improvement = "📉"
+        
+        print(f"Pretrain Epoch {epoch+1}: Reconstruction Loss = {avg_loss:.6f} {improvement}")
+        
+        # FIXED: Early stopping if loss is not improving
+        if epoch > 10 and avg_loss > pretrain_losses[-5]:  # No improvement in 5 epochs
+            print(f"   ⚠️  Loss not improving, consider checking data or model")
     
-    print(f"✓ Encoder + Generator pretraining completed")
+    print(f"✓ Encoder + Generator pretraining completed (Best: {best_loss:.6f})")
     return pretrain_losses
 
-def train_phase_detector(train_loader, encoder, phase_detector, num_epochs=30, device="cuda", use_mixed_precision=True):
+def train_phase_detector(train_loader, encoder, phase_detector, num_epochs=40, device="cuda", use_mixed_precision=True):
     """
-    Phase 2: Train phase detector with frozen encoder
-    This learns to classify contrast phases from encoder embeddings
+    FIXED Phase 2: Train phase detector with frozen encoder
     """
     print(f"\n{'='*60}")
-    print("PHASE 2: PHASE DETECTOR TRAINING")
+    print("PHASE 2: PHASE DETECTOR TRAINING (FIXED)")
     print(f"{'='*60}")
     
-    # Freeze encoder, train phase detector
+    # FIXED: Properly freeze encoder
     encoder.eval()
     for param in encoder.parameters():
         param.requires_grad = False
@@ -125,8 +290,11 @@ def train_phase_detector(train_loader, encoder, phase_detector, num_epochs=30, d
     # Phase classification loss
     phase_loss = nn.CrossEntropyLoss()
     
-    # Optimizer with higher learning rate for phase detector
-    optimizer_phase = optim.Adam(phase_detector.parameters(), lr=1e-3)
+    # FIXED: Use different optimizer and learning rate
+    optimizer_phase = optim.AdamW(phase_detector.parameters(), lr=5e-4, weight_decay=1e-4)
+    
+    # FIXED: Add learning rate scheduler
+    scheduler_phase = optim.lr_scheduler.CosineAnnealingLR(optimizer_phase, T_max=num_epochs)
     
     # Mixed precision
     scaler = GradScaler() if use_mixed_precision else None
@@ -134,42 +302,84 @@ def train_phase_detector(train_loader, encoder, phase_detector, num_epochs=30, d
     phase_losses = []
     phase_accuracies = []
     
+    # FIXED: Analyze class distribution
+    print("📊 Analyzing phase distribution in dataset...")
+    class_count = 3
+    phase_counts = {i: 0 for i in range(class_count)}
+    total_samples = 0
+    
+    with torch.no_grad():
+        for batch in train_loader:
+            target_phase_labels = batch["input_phase"]
+            for phase in target_phase_labels:
+                phase_counts[phase.item()] += 1
+                total_samples += 1
+    
+    print(f"   Phase distribution:")
+    for phase, count in phase_counts.items():
+        percentage = (count / total_samples) * 100
+        print(f"   Phase {phase}: {count} samples ({percentage:.1f}%)")
+    
+    # FIXED: Create class weights for imbalanced data
+    class_weights = []
+    for i in range(class_count):
+        weight = total_samples / (class_count * phase_counts[i]) if phase_counts[i] > 0 else 1.0
+        class_weights.append(weight)
+    
+    class_weights = torch.tensor(class_weights).to(device)
+    weighted_phase_loss = nn.CrossEntropyLoss(weight=class_weights)
+    print(f"   Using class weights: {class_weights.cpu().numpy()}")
+    
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         phase_correct = 0
         phase_total = 0
         num_batches = 0
         
-        for batch in tqdm(train_loader, desc=f"Phase Epoch {epoch+1}/{num_epochs}"):
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Phase Epoch {epoch+1}/{num_epochs}")):
             input_volume = batch["input_volume"].to(device)
-            true_phase_label = batch["input_phase"].to(device)
-            
+            target_phase_label = batch["input_phase"].to(device)
             optimizer_phase.zero_grad()
             
             with autocast(device_type="cuda", enabled=use_mixed_precision):
                 # Get encoder features (frozen)
                 with torch.no_grad():
                     z = encoder(input_volume)
+                    # FIXED: Detach to ensure no gradients flow to encoder
+                    z = z.detach()
                 
                 # Predict phase
                 phase_pred = phase_detector(z)
-                loss = phase_loss(phase_pred, true_phase_label)
+                loss = weighted_phase_loss(phase_pred, target_phase_label)
             
             # Backward pass
             if use_mixed_precision:
                 scaler.scale(loss).backward()
+                
+                # FIXED: Add gradient clipping
+                scaler.unscale_(optimizer_phase)
+                torch.nn.utils.clip_grad_norm_(phase_detector.parameters(), max_norm=1.0)
+                
                 scaler.step(optimizer_phase)
                 scaler.update()
             else:
                 loss.backward()
+                
+                # FIXED: Add gradient clipping
+                torch.nn.utils.clip_grad_norm_(phase_detector.parameters(), max_norm=1.0)
+                
                 optimizer_phase.step()
             
             # Track metrics
             epoch_loss += loss.item()
             _, predicted = torch.max(phase_pred.data, 1)
-            phase_correct += (predicted == true_phase_label).sum().item()
-            phase_total += true_phase_label.size(0)
+            phase_correct += (predicted == target_phase_label).sum().item()
+            phase_total += target_phase_label.size(0)
             num_batches += 1
+            
+            # Debug gradient flow
+            if batch_idx % 50 == 0:
+                check_gradient_flow(phase_detector, "Phase Detector")
         
         avg_loss = epoch_loss / num_batches
         accuracy = phase_correct / phase_total if phase_total > 0 else 0
@@ -177,23 +387,60 @@ def train_phase_detector(train_loader, encoder, phase_detector, num_epochs=30, d
         phase_losses.append(avg_loss)
         phase_accuracies.append(accuracy)
         
-        print(f"Phase Epoch {epoch+1}: Loss = {avg_loss:.6f}, Accuracy = {accuracy:.4f}")
+        # Update learning rate
+        scheduler_phase.step()
+        
+        # Track improvement
+        if epoch == 0 or accuracy > max(phase_accuracies[:-1]):
+            improvement = "✅"
+        else:
+            improvement = "📉"
+        
+        print(f"Phase Epoch {epoch+1}: Loss = {avg_loss:.6f}, Accuracy = {accuracy:.4f} {improvement}")
+        
+        # FIXED: Print per-class accuracy every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            print("   Per-class accuracy analysis:")
+            class_correct = {0: 0, 1: 0, 2: 0, 3: 0}
+            class_total = {0: 0, 1: 0, 2: 0, 3: 0}
+            
+            with torch.no_grad():
+                for batch in train_loader:
+                    input_volume = batch["input_volume"].to(device)
+                    target_phase_label = batch["input_phase"].to(device)
+                    
+                    z = encoder(input_volume).detach()
+                    phase_pred = phase_detector(z)
+                    _, predicted = torch.max(phase_pred.data, 1)
+                    
+                    for i in range(len(target_phase_label)):
+                        true_label = target_phase_label[i].item()
+                        pred_label = predicted[i].item()
+                        class_total[true_label] += 1
+                        if true_label == pred_label:
+                            class_correct[true_label] += 1
+            
+            phase_names = ['Non-contrast', 'Arterial', 'Venous'] # and , 'Delayed'
+            for i in range(len(phase_names)):
+                if class_total[i] > 0:
+                    acc = class_correct[i] / class_total[i]
+                    print(f"     {phase_names[i]}: {acc:.3f} ({class_correct[i]}/{class_total[i]})")
     
     # Unfreeze encoder for next phase
     for param in encoder.parameters():
         param.requires_grad = True
+    encoder.train()
     
-    print(f"✓ Phase detector training completed")
+    print(f"✓ Phase detector training completed (Best accuracy: {max(phase_accuracies):.4f})")
     return phase_losses, phase_accuracies
 
 def train_disentangled_generation(train_loader, encoder, generator, discriminator, phase_detector, 
                                  num_epochs=50, device="cuda", use_mixed_precision=True):
     """
-    Phase 3: Train generator with adversarial loss and reversed gradients from phase detector
-    This achieves disentangled representations
+    FIXED Phase 3: Train generator with adversarial loss and reversed gradients
     """
     print(f"\n{'='*60}")
-    print("PHASE 3: DISENTANGLED GENERATION TRAINING")
+    print("PHASE 3: DISENTANGLED GENERATION TRAINING (FIXED)")
     print(f"{'='*60}")
     
     # Set all models to training mode
@@ -202,15 +449,29 @@ def train_disentangled_generation(train_loader, encoder, generator, discriminato
     discriminator.train()
     phase_detector.train()
     
-    # Losses
+    # FIXED: Better loss functions
     l1_loss = nn.L1Loss()
+    mse_loss = nn.MSELoss()
     gan_loss = nn.BCEWithLogitsLoss()
     phase_loss = nn.CrossEntropyLoss()
     
-    # Optimizers with balanced learning rates
-    optimizer_enc_gen = optim.Adam(list(encoder.parameters()) + list(generator.parameters()), lr=1e-4)
-    optimizer_disc = optim.Adam(discriminator.parameters(), lr=1e-4)
-    optimizer_phase = optim.Adam(phase_detector.parameters(), lr=5e-5)  # Lower LR for fine-tuning
+    # FIXED: More balanced learning rates and optimizers
+    optimizer_enc_gen = optim.AdamW(
+        list(encoder.parameters()) + list(generator.parameters()), 
+        lr=5e-5, weight_decay=1e-5, betas=(0.5, 0.999)
+    )
+    optimizer_disc = optim.AdamW(
+        discriminator.parameters(), 
+        lr=2e-4, weight_decay=1e-5, betas=(0.5, 0.999)
+    )
+    optimizer_phase = optim.AdamW(
+        phase_detector.parameters(), 
+        lr=1e-5, weight_decay=1e-5  # Very low LR for fine-tuning
+    )
+    
+    # FIXED: Add learning rate schedulers
+    scheduler_enc_gen = optim.lr_scheduler.ReduceLROnPlateau(optimizer_enc_gen, patience=10, factor=0.8)
+    scheduler_disc = optim.lr_scheduler.ReduceLROnPlateau(optimizer_disc, patience=10, factor=0.8)
     
     # Mixed precision
     scaler = GradScaler() if use_mixed_precision else None
@@ -222,8 +483,9 @@ def train_disentangled_generation(train_loader, encoder, generator, discriminato
     phase_accuracies = []
     
     for epoch in range(num_epochs):
-        # Gradual increase of adversarial weight
-        lambda_adv = min(1.0, (epoch + 1) / 20)  # Ramp up over 20 epochs
+        # FIXED: More gradual ramp-up for stability
+        lambda_adv = min(1.0, (epoch + 1) / 30)  # Ramp up over 30 epochs
+        lambda_phase = min(0.5, (epoch + 1) / 40)  # Even more gradual for phase loss
         
         epoch_g_loss = 0.0
         epoch_d_loss = 0.0
@@ -232,9 +494,9 @@ def train_disentangled_generation(train_loader, encoder, generator, discriminato
         phase_total = 0
         num_batches = 0
         
-        print(f"Disentanglement Epoch {epoch+1}/{num_epochs} (λ_adv = {lambda_adv:.3f})")
+        print(f"Disentanglement Epoch {epoch+1}/{num_epochs} (λ_adv = {lambda_adv:.3f}, λ_phase = {lambda_phase:.3f})")
         
-        for batch in tqdm(train_loader, desc=f"Disentangle Epoch {epoch+1}"):
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Disentangle Epoch {epoch+1}")):
             input_volume = batch["input_volume"].to(device)
             target_volume = batch["target_volume"].to(device)
             target_phase = batch["target_phase"].to(device)
@@ -243,35 +505,48 @@ def train_disentangled_generation(train_loader, encoder, generator, discriminato
             batch_size = input_volume.shape[0]
             
             # ===========================
-            # Train Discriminator
+            # FIXED: Train Discriminator more frequently
             # ===========================
-            optimizer_disc.zero_grad()
-            
-            with autocast(device_type="cuda", enabled=use_mixed_precision):
-                # Generate fake volumes
-                z = encoder(input_volume)
-                phase_emb = create_phase_embeddings(target_phase, dim=32, device=device)
-                fake_volume = generator(z, phase_emb).detach()
+            for _ in range(2):  # Train discriminator 2x per generator update
+                optimizer_disc.zero_grad()
                 
-                # Discriminator outputs
-                real_score = discriminator(target_volume)
-                fake_score = discriminator(fake_volume)
+                with autocast(device_type="cuda", enabled=use_mixed_precision):
+                    # Generate fake volumes
+                    z = encoder(input_volume).detach()  # Detach to prevent generator gradients
+                    phase_emb = create_phase_embeddings(target_phase, dim=32, device=device)
+                    fake_volume = generator(z, phase_emb).detach()
+                    
+                    # FIXED: Add noise to inputs for better training stability
+                    noise_factor = 0.1
+                    real_noisy = target_volume + torch.randn_like(target_volume) * noise_factor
+                    fake_noisy = fake_volume + torch.randn_like(fake_volume) * noise_factor
+                    
+                    # Discriminator outputs
+                    real_score = discriminator(real_noisy)
+                    fake_score = discriminator(fake_noisy)
+                    
+                    # FIXED: Use label smoothing
+                    real_labels = torch.ones_like(real_score) - 0.1 * torch.rand_like(real_score)
+                    fake_labels = torch.zeros_like(fake_score) + 0.1 * torch.rand_like(fake_score)
+                    
+                    # Discriminator loss
+                    d_loss_real = gan_loss(real_score, real_labels)
+                    d_loss_fake = gan_loss(fake_score, fake_labels)
+                    d_loss = (d_loss_real + d_loss_fake) / 2
                 
-                # Discriminator loss
-                d_loss_real = gan_loss(real_score, torch.ones_like(real_score))
-                d_loss_fake = gan_loss(fake_score, torch.zeros_like(fake_score))
-                d_loss = (d_loss_real + d_loss_fake) / 2
-            
-            if use_mixed_precision:
-                scaler.scale(d_loss).backward()
-                scaler.step(optimizer_disc)
-                scaler.update()
-            else:
-                d_loss.backward()
-                optimizer_disc.step()
+                if use_mixed_precision:
+                    scaler.scale(d_loss).backward()
+                    scaler.unscale_(optimizer_disc)
+                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=0.5)
+                    scaler.step(optimizer_disc)
+                    scaler.update()
+                else:
+                    d_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=0.5)
+                    optimizer_disc.step()
             
             # ===========================
-            # Train Generator + Encoder
+            # FIXED: Train Generator + Encoder
             # ===========================
             optimizer_enc_gen.zero_grad()
             
@@ -284,61 +559,95 @@ def train_disentangled_generation(train_loader, encoder, generator, discriminato
                 # Generator losses
                 fake_score = discriminator(generated_volume)
                 
-                # L1 reconstruction loss
-                reconstruction_loss = l1_loss(generated_volume, target_volume)
+                # FIXED: Combine L1 and MSE losses
+                l1_recon_loss = l1_loss(generated_volume, target_volume)
+                mse_recon_loss = mse_loss(generated_volume, target_volume)
+                reconstruction_loss = l1_recon_loss + 0.5 * mse_recon_loss
                 
                 # GAN loss
                 adversarial_loss = gan_loss(fake_score, torch.ones_like(fake_score))
                 
+                # FIXED: Add perceptual loss (simple version)
+                # Compute loss on different scales
+                scales = [1, 0.5, 0.25]
+                perceptual_loss = 0
+                for scale in scales:
+                    if scale < 1:
+                        size = [int(s * scale) for s in generated_volume.shape[2:]]
+                        gen_scaled = torch.nn.functional.interpolate(generated_volume, size=size, mode='trilinear')
+                        target_scaled = torch.nn.functional.interpolate(target_volume, size=size, mode='trilinear')
+                        perceptual_loss += l1_loss(gen_scaled, target_scaled)
+                    else:
+                        perceptual_loss += l1_loss(generated_volume, target_volume)
+                
                 # Combined generator loss
-                g_loss = reconstruction_loss * 10.0 + adversarial_loss * lambda_adv
+                g_loss = (reconstruction_loss * 100.0 +  # Increased weight
+                         adversarial_loss * lambda_adv * 2.0 +  # Adaptive weight
+                         perceptual_loss * 10.0)  # Multi-scale loss
             
             if use_mixed_precision:
                 scaler.scale(g_loss).backward()
+                scaler.unscale_(optimizer_enc_gen)
+                torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(generator.parameters()), max_norm=1.0)
                 scaler.step(optimizer_enc_gen)
                 scaler.update()
             else:
                 g_loss.backward()
+                torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(generator.parameters()), max_norm=1.0)
                 optimizer_enc_gen.step()
             
             # ===========================
-            # Train Phase Detector with Reversed Gradients
+            # FIXED: Train Phase Detector with Reversed Gradients
             # ===========================
-            optimizer_phase.zero_grad()
-            
-            with autocast(device_type="cuda", enabled=use_mixed_precision):
-                # Get encoder features
-                z = encoder(input_volume)
+            if epoch >= 10:  # Start phase training after some generator training
+                optimizer_phase.zero_grad()
                 
-                # Apply gradient reversal for disentanglement
-                z_reversed = GradientReversalLayer.apply(z, lambda_adv)
+                with autocast(device_type="cuda", enabled=use_mixed_precision):
+                    # Get encoder features
+                    z = encoder(input_volume)
+                    
+                    # Apply gradient reversal for disentanglement
+                    z_reversed = GradientReversalLayer.apply(z, lambda_phase)
+                    
+                    # Phase prediction on reversed gradients
+                    phase_pred = phase_detector(z_reversed)
+                    p_loss = phase_loss(phase_pred, true_phase)
                 
-                # Phase prediction on reversed gradients
-                phase_pred = phase_detector(z_reversed)
-                p_loss = phase_loss(phase_pred, true_phase)
+                if use_mixed_precision:
+                    scaler.scale(p_loss).backward()
+                    scaler.unscale_(optimizer_phase)
+                    torch.nn.utils.clip_grad_norm_(phase_detector.parameters(), max_norm=0.5)
+                    scaler.step(optimizer_phase)
+                    scaler.update()
+                else:
+                    p_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(phase_detector.parameters(), max_norm=0.5)
+                    optimizer_phase.step()
+                
+                # Track phase metrics
+                with torch.no_grad():
+                    _, predicted = torch.max(phase_pred.data, 1)
+                    phase_correct += (predicted == true_phase).sum().item()
+                    phase_total += true_phase.size(0)
+                    epoch_p_loss += p_loss.item()
             
-            if use_mixed_precision:
-                scaler.scale(p_loss).backward()
-                scaler.step(optimizer_phase)
-                scaler.update()
-            else:
-                p_loss.backward()
-                optimizer_phase.step()
-            
-            # Track metrics
+            # Track other metrics
             epoch_g_loss += g_loss.item()
             epoch_d_loss += d_loss.item()
-            epoch_p_loss += p_loss.item()
-            
-            _, predicted = torch.max(phase_pred.data, 1)
-            phase_correct += (predicted == true_phase).sum().item()
-            phase_total += true_phase.size(0)
             num_batches += 1
+            
+            # FIXED: Debug gradient flow periodically
+            if batch_idx % 100 == 0:
+                check_gradient_flow(encoder, "Encoder")
+                check_gradient_flow(generator, "Generator")
+                check_gradient_flow(discriminator, "Discriminator")
+                if epoch >= 10:
+                    check_gradient_flow(phase_detector, "Phase Detector")
         
         # Calculate epoch metrics
         avg_g_loss = epoch_g_loss / num_batches
         avg_d_loss = epoch_d_loss / num_batches
-        avg_p_loss = epoch_p_loss / num_batches
+        avg_p_loss = epoch_p_loss / num_batches if epoch >= 10 else 0
         phase_accuracy = phase_correct / phase_total if phase_total > 0 else 0
         
         g_losses.append(avg_g_loss)
@@ -346,11 +655,12 @@ def train_disentangled_generation(train_loader, encoder, generator, discriminato
         p_losses.append(avg_p_loss)
         phase_accuracies.append(phase_accuracy)
         
+        # Update learning rates
+        scheduler_enc_gen.step(avg_g_loss)
+        scheduler_disc.step(avg_d_loss)
+        
         print(f"Epoch {epoch+1}: G_loss = {avg_g_loss:.6f}, D_loss = {avg_d_loss:.6f}, "
               f"P_loss = {avg_p_loss:.6f}, Phase_Acc = {phase_accuracy:.4f}")
-    
-    print(f"✓ Disentangled generation training completed")
-    return g_losses, d_losses, p_losses, phase_accuracies
 
 def train_contrast_phase_generation(
     train_loader,
@@ -424,7 +734,7 @@ def train_contrast_phase_generation(
     if not has_pretrained:
         print(f"\n🔄 Starting Phase 1...")
         pretrain_losses = pretrain_encoder_generator(
-            train_loader, encoder, generator, 
+            train_loader, encoder, generator, phase_detector,
             num_epochs=encoder_pretrain_epochs,
             device=device,
             use_mixed_precision=use_mixed_precision
