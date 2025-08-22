@@ -367,18 +367,22 @@ class MedViTEncoder3D(nn.Module):
             
             # Get features from MedViT without independent autocast
             # (rely on outer context or set enabled=False if not using mixed precision)
-            with torch.amp.autocast('cuda', enabled=False):  # Disable here or pass a flag
+            if torch.is_autocast_enabled():
+                with torch.cuda.amp.autocast(enabled=False):
+                    medvit_features = self.medvit(slice_2d)
+                    
+                    # Handle different output formats
+                    if isinstance(medvit_features, tuple):
+                        medvit_features = medvit_features[0]
+                    if isinstance(medvit_features, dict):
+                        medvit_features = list(medvit_features.values())[0]
+                    
+                    # Ensure correct shape
+                    while medvit_features.dim() > 2:
+                        medvit_features = medvit_features.mean(dim=-1)
+            else:
                 medvit_features = self.medvit(slice_2d)
-                
-                # Handle different output formats
-                if isinstance(medvit_features, tuple):
-                    medvit_features = medvit_features[0]
-                if isinstance(medvit_features, dict):
-                    medvit_features = list(medvit_features.values())[0]
-                
-                # Ensure correct shape
-                while medvit_features.dim() > 2:
-                    medvit_features = medvit_features.mean(dim=-1)
+              
             
             # Project to latent dimension (now dtypes match)
             slice_latent = self.feature_projection(medvit_features.float())  # Explicit cast if needed

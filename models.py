@@ -372,20 +372,43 @@ class Discriminator(nn.Module):
 
 
 class PhaseDetector(nn.Module):
-    def __init__(self, latent_dim=256, num_phases=4):
-        super().__init__()  # ✅ Call parent class __init__ first
-        self.model = nn.Sequential(
-            nn.Linear(latent_dim, 512),      # Larger capacity
-            nn.BatchNorm1d(512),             # Batch normalization
+    def __init__(self, latent_dim=256, num_phases=4, dropout_rate=0.3):
+        super().__init__()
+        
+        # Input normalization
+        self.input_norm = nn.LayerNorm(latent_dim)
+        
+        # Three processing blocks
+        self.block1 = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
             nn.ReLU(),
-            nn.Dropout(0.3),                 # Regularization
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, num_phases)       # No softmax (let CrossEntropy handle it)
+            nn.Dropout(dropout_rate)
         )
-        # Initialize weights properly
+        
+        self.block2 = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.LayerNorm(latent_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        self.block3 = nn.Sequential(
+            nn.Linear(latent_dim // 2, latent_dim // 4),
+            nn.LayerNorm(latent_dim // 4),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate // 2)
+        )
+        
+        # Three classification heads
+        self.head1 = nn.Linear(latent_dim // 4, num_phases)
+        self.head2 = nn.Linear(latent_dim // 2, num_phases)  
+        self.head3 = nn.Linear(latent_dim, num_phases)
+        
+        # Final fusion
+        self.fusion = nn.Linear(num_phases * 3, num_phases)
+        
+        # Initialize weights
         self.apply(self._init_weights)
     
     def _init_weights(self, module):
@@ -393,6 +416,96 @@ class PhaseDetector(nn.Module):
             torch.nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.ones_(module.weight)
+            torch.nn.init.zeros_(module.bias)
 
     def forward(self, z):
-        return self.model(z)  # (batch, num_phases)
+        # Normalize input
+        z_norm = self.input_norm(z)
+        
+        # Process through blocks
+        x1 = self.block1(z_norm)
+        x2 = self.block2(x1)
+        x3 = self.block3(x2)
+        
+        # Three predictions
+        pred1 = self.head1(x3)    # From final block
+        pred2 = self.head2(x2)    # From middle block
+        pred3 = self.head3(z_norm) # Direct from input
+        
+        # Combine predictions
+        combined = torch.cat([pred1, pred2, pred3], dim=1)
+        final_output = self.fusion(combined)
+        
+        return final_output
+    # def __init__(self, latent_dim=256, num_phases=4):
+    #     super().__init__()  # ✅ Call parent class __init__ first
+    #     self.model = nn.Sequential(
+    #         nn.Linear(latent_dim, 512),      # Larger capacity
+    #         nn.BatchNorm1d(512),             # Batch normalization
+    #         nn.ReLU(),
+    #         nn.Dropout(0.3),                 # Regularization
+    #         nn.Linear(512, 256),
+    #         nn.BatchNorm1d(256),
+    #         nn.ReLU(),
+    #         nn.Dropout(0.2),
+    #         nn.Linear(256, num_phases)       # No softmax (let CrossEntropy handle it)
+    #     )
+    #     # Initialize weights properly
+    #     self.apply(self._init_weights)
+    
+    # def _init_weights(self, module):
+    #     if isinstance(module, nn.Linear):
+    #         torch.nn.init.xavier_uniform_(module.weight)
+    #         if module.bias is not None:
+    #             torch.nn.init.zeros_(module.bias)
+
+    # def forward(self, z):
+    #     return self.model(z)  # (batch, num_phases)
+
+
+
+# Test function to verify it works
+def test_phase_detector_fix():
+    """Quick test to make sure the improved detector works"""
+    
+    # Test parameters
+    latent_dim = 256
+    num_phases = 3
+    batch_size = 4
+    
+    # Create test data
+    test_features = torch.randn(batch_size, latent_dim)
+    test_labels = torch.randint(0, num_phases, (batch_size,))
+    
+    print(f"Testing ImprovedPhaseDetector...")
+    print(f"Input: {test_features.shape}")
+    print(f"Labels: {test_labels}")
+    
+    # Create detector
+    detector = PhaseDetector(latent_dim=latent_dim, num_phases=num_phases)
+    
+    # Test forward pass
+    with torch.no_grad():
+        output = detector(test_features)
+        probabilities = torch.softmax(output, dim=1)
+    
+    print(f"✅ Output shape: {output.shape}")
+    print(f"✅ Sample probabilities: {probabilities[0].numpy()}")
+    
+    # Test training step
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(detector.parameters(), lr=1e-3)
+    
+    optimizer.zero_grad()
+    output = detector(test_features)
+    loss = criterion(output, test_labels)
+    loss.backward()
+    optimizer.step()
+    
+    print(f"✅ Training step works, loss: {loss.item():.4f}")
+    print(f"✅ ImprovedPhaseDetector is ready to use!")
+
+if __name__ == "__main__":
+    test_phase_detector_fix()

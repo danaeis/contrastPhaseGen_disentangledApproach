@@ -238,7 +238,7 @@ def main():
             output_shape=(*img_size, 1)
         )
         discriminator = Discriminator(input_shape=(*img_size, 1))
-        phase_detector = PhaseDetector(latent_dim=args.latent_dim, num_phases=4)
+        phase_detector = PhaseDetector(latent_dim=args.latent_dim, num_phases=3)
         
         # Handle resume from checkpoint
         start_epoch = 0
