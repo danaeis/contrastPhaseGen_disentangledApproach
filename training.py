@@ -56,18 +56,18 @@ def debug_data_flow(batch, encoder, generator, phase_detector, device):
     print("🔍 DEBUGGING DATA FLOW")
     print("="*60)
     
-    input_volume = batch["input_volume"].to(device)
-    target_volume = batch["target_volume"].to(device) 
-    phase_label = batch["target_phase"].to(device)
-    target_phase_label = batch["input_phase"].to(device)
+    input_volume = batch["input_path"].to(device)
+    target_volume = batch["target_path"].to(device) 
+    input_phase_label = batch["input_phase"].to(device)
+    target_phase_label = batch["target_phase"].to(device)
     
     print(f"📊 Batch Info:")
     print(f"   Input volume shape: {input_volume.shape}")
     print(f"   Target volume shape: {target_volume.shape}")
     print(f"   Input volume range: [{input_volume.min():.3f}, {input_volume.max():.3f}]")
     print(f"   Target volume range: [{target_volume.min():.3f}, {target_volume.max():.3f}]")
-    print(f"   Phase labels: {phase_label.cpu().numpy()}")
-    print(f"   True phases: {target_phase_label.cpu().numpy()}")
+    print(f"   Input Phase labels: {input_phase_label.cpu().numpy()}")
+    print(f"   Target phase labels: {target_phase_label.cpu().numpy()}")
     
     # Test encoder
     with torch.no_grad():
@@ -84,7 +84,7 @@ def debug_data_flow(batch, encoder, generator, phase_detector, device):
             print("   ⚠️  WARNING: Inf detected in encoder output!")
     
     # Test phase embedding
-    phase_emb = create_phase_embeddings(phase_label, dim=32, device=device)
+    phase_emb = create_phase_embeddings(target_phase_label, dim=32, device=device)
     print(f"\n🎯 Phase Embedding:")
     print(f"   Phase embedding shape: {phase_emb.shape}")
     print(f"   Phase embedding range: [{phase_emb.min():.3f}, {phase_emb.max():.3f}]")
@@ -197,10 +197,10 @@ def pretrain_encoder_generator(train_loader, encoder, generator, phase_detector,
         num_batches = 0
         
         for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Pretrain Epoch {epoch+1}/{num_epochs}")):
-            input_volume = batch["input_volume"].to(device)
+            input_volume = batch["input_path"].to(device)
             input_phase = batch["input_phase"].to(device)
             # FIXED: Use target volume as reconstruction target
-            target_volume = batch["target_volume"].to(device)
+            target_volume = batch["target_path"].to(device)
             target_phase = batch["target_phase"].to(device)
             
             optimizer_enc.zero_grad()
@@ -292,77 +292,33 @@ def train_phase_detector(train_loader, encoder, phase_detector,
                          num_epochs=40, device="cuda", use_mixed_precision=True,
                          spatial_size=(128,128,128), checkpoint_dir="checkpoints"):
     """
-    OPTIMIZED: Phase detector training that accepts train_loader and extracts unique volumes
+    QUICK FIX: Unfreeze encoder and use joint training
     """
     print(f"\n{'='*60}")
-    print("PHASE 2: OPTIMIZED PHASE DETECTOR TRAINING")
+    print("PHASE 2: QUICK FIX - UNFROZEN ENCODER TRAINING")
     print(f"{'='*60}")
     
-    # Extract unique volumes from the train_loader's dataset
-    print("🔍 Extracting unique volumes from train_loader...")
+    # Extract unique volumes (keep your existing logic)
     unique_volumes = {}
     phase_counts = defaultdict(int)
     
-    # Access the underlying dataset from the DataLoader
     dataset = train_loader.dataset
-    
-    # Extract unique volumes from dataset data
     if hasattr(dataset, 'data'):
-        # MONAI Dataset stores data in .data attribute
         data_dicts = dataset.data
-    else:
-        # Fallback: try to access through dataset directly
-        print("⚠️  Warning: Could not access dataset.data, using alternative method")
-        data_dicts = []
-        
-        # Alternative: iterate through the loader once to collect unique data
-        # This is less efficient but works if dataset.data is not accessible
-        temp_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
-        seen_paths = set()
-        
-        for batch in temp_loader:
-            input_volume_paths = batch.get("input_volume_meta_dict", {}).get("filename_or_obj", [])
-            input_phases = batch["input_phase"]
-            scan_ids = batch.get("scan_id", ["unknown"])
+        for data_dict in data_dicts:
+            input_path = data_dict["input_path"]
+            input_phase = data_dict["input_phase"]
+            scan_id = data_dict.get("scan_id", "unknown")
             
-            if isinstance(input_volume_paths, (list, tuple)):
-                input_volume_path = input_volume_paths[0] if input_volume_paths else "unknown"
-            else:
-                input_volume_path = str(input_volume_paths)
-            
-            if input_volume_path not in seen_paths and input_volume_path != "unknown":
-                seen_paths.add(input_volume_path)
-                data_dicts.append({
-                    "input_volume": input_volume_path,
-                    "input_phase": input_phases[0].item() if torch.is_tensor(input_phases[0]) else input_phases[0],
-                    "scan_id": scan_ids[0] if isinstance(scan_ids, (list, tuple)) else scan_ids
-                })
-    
-    # Create unique phase detection dataset
-    for data_dict in data_dicts:
-        input_path = data_dict["input_path"]
-        input_phase = data_dict["input_phase"]
-        scan_id = data_dict.get("scan_id", "unknown")
-        
-        # Use path as unique identifier
-        if input_path not in unique_volumes:
-            unique_volumes[input_path] = {
-                "volume": input_path,
-                "phase": input_phase,
-                "scan_id": scan_id
-            }
-            phase_counts[input_phase] += 1
+            if input_path not in unique_volumes:
+                unique_volumes[input_path] = {
+                    "volume": input_path,
+                    "phase": input_phase,
+                    "scan_id": scan_id
+                }
+                phase_counts[input_phase] += 1
     
     unique_data_dicts = list(unique_volumes.values())
-    
-    print(f"   Original pairs in loader: {len(data_dicts)}")
-    print(f"   Unique volumes extracted: {len(unique_data_dicts)}")
-    print(f"   Phase distribution:")
-    
-    phase_names = {0: 'Non-contrast', 1: 'Arterial', 2: 'Venous', 3: 'Delayed'}
-    for phase, count in sorted(phase_counts.items()):
-        phase_name = phase_names.get(phase, f'Phase_{phase}')
-        print(f"     {phase_name}: {count} volumes")
     
     # Create phase detection DataLoader
     from data import prepare_phase_detection_data
@@ -379,41 +335,52 @@ def train_phase_detector(train_loader, encoder, phase_detector,
         restore_best_weights=True
     )
     
-    # Freeze encoder
-    encoder.eval()
+    # 🔥 CRITICAL FIX: UNFREEZE ENCODER
+    print("🔓 CRITICAL FIX: Unfreezing encoder for joint training...")
+    encoder.train()  # Set to training mode
     for param in encoder.parameters():
-        param.requires_grad = False
+        param.requires_grad = True  # ENABLE gradients
     
     phase_detector.train()
     
     # Analyze class distribution and setup weighted loss
     unique_phases = set(phase_counts.keys())
     num_classes = len(unique_phases)
+    total_samples = len(unique_data_dicts)
+    
     print(f"📊 Detected {num_classes} unique phases: {sorted(unique_phases)}")
     
-    # Create class weights (this helps with medical data imbalance)
-    total_samples = len(unique_data_dicts)
+    # Create class weights
     class_weights = []
-    for i in range(max(unique_phases) + 1):  # Ensure we cover all phase indices
+    for i in range(max(unique_phases) + 1):
         if i in phase_counts:
             weight = total_samples / (num_classes * phase_counts[i])
         else:
             weight = 1.0
         class_weights.append(weight)
     
-    # Only keep weights for phases that exist
     actual_class_weights = [class_weights[i] for i in sorted(unique_phases)]
     class_weights_tensor = torch.tensor(actual_class_weights).to(device)
     print(f"   Using class weights: {class_weights_tensor.cpu().numpy()}")
     
-    # Loss and optimizer
+    # 🔥 FIX: Joint optimizer with lower learning rate
     weighted_loss = nn.CrossEntropyLoss(weight=class_weights_tensor)
-    optimizer = torch.optim.AdamW(
-        phase_detector.parameters(), 
-        lr=5e-4, 
+    
+    # Separate optimizers for better control
+    optimizer_encoder = torch.optim.AdamW(
+        encoder.parameters(), 
+        lr=1e-5,  # Very low LR for encoder
         weight_decay=1e-4
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    optimizer_phase = torch.optim.AdamW(
+        phase_detector.parameters(), 
+        lr=5e-4,  # Higher LR for phase detector
+        weight_decay=1e-4
+    )
+    
+    # Learning rate schedulers
+    scheduler_encoder = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_encoder, T_max=num_epochs)
+    scheduler_phase = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_phase, T_max=num_epochs)
     
     # Mixed precision
     scaler = GradScaler() if use_mixed_precision else None
@@ -424,7 +391,7 @@ def train_phase_detector(train_loader, encoder, phase_detector,
     best_accuracy = 0.0
     best_epoch = 0
     
-    print(f"🚀 Starting optimized phase detector training...")
+    print(f"🚀 Starting quick fix training with unfrozen encoder...")
     
     for epoch in range(num_epochs):
         epoch_loss = 0.0
@@ -432,33 +399,52 @@ def train_phase_detector(train_loader, encoder, phase_detector,
         total_predictions = 0
         num_batches = 0
         
-        # Training loop
-        for batch_idx, batch in enumerate(tqdm(phase_loader, desc=f"Phase Epoch {epoch+1}/{num_epochs}")):
+        # 🔥 FEATURE ANALYSIS
+        epoch_features = []
+        epoch_phases = []
+        
+        for batch_idx, batch in enumerate(tqdm(phase_loader, desc=f"QuickFix Epoch {epoch+1}/{num_epochs}")):
             volumes = batch["volume"].to(device)
             true_phases = batch["phase"].to(device)
             
-            optimizer.zero_grad()
+            # Zero gradients for both optimizers
+            optimizer_encoder.zero_grad()
+            optimizer_phase.zero_grad()
             
             with autocast(device_type="cuda", enabled=use_mixed_precision):
-                # Extract features (frozen encoder)
-                with torch.no_grad():
-                    features = encoder(volumes).detach()
+                # 🔥 FIX: Extract features with gradients enabled
+                features = encoder(volumes)  # No torch.no_grad()!
+                
+                # Store features for analysis
+                if batch_idx < 10:  # Only first 10 batches for memory
+                    epoch_features.append(features.detach().cpu())
+                    epoch_phases.extend(true_phases.cpu().numpy())
                 
                 # Phase prediction
                 phase_logits = phase_detector(features)
                 loss = weighted_loss(phase_logits, true_phases)
             
-            # Backward pass
+            # 🔥 FIX: Backward pass for both networks
             if use_mixed_precision:
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
+                
+                # Gradient clipping
+                scaler.unscale_(optimizer_encoder)
+                scaler.unscale_(optimizer_phase)
+                torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=0.5)
                 torch.nn.utils.clip_grad_norm_(phase_detector.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
+                
+                scaler.step(optimizer_encoder)
+                scaler.step(optimizer_phase)
                 scaler.update()
             else:
                 loss.backward()
+                
+                torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=0.5)
                 torch.nn.utils.clip_grad_norm_(phase_detector.parameters(), max_norm=1.0)
-                optimizer.step()
+                
+                optimizer_encoder.step()
+                optimizer_phase.step()
             
             # Track metrics
             epoch_loss += loss.item()
@@ -466,6 +452,22 @@ def train_phase_detector(train_loader, encoder, phase_detector,
             correct_predictions += (predicted == true_phases).sum().item()
             total_predictions += true_phases.size(0)
             num_batches += 1
+            
+            # 🔥 ENHANCED DEBUGGING
+            if batch_idx % 25 == 0 and batch_idx < 100:
+                print(f"\n🔬 QUICK FIX DEBUG Batch {batch_idx}:")
+                print(f"Volume range: [{volumes.min():.3f}, {volumes.max():.3f}]")
+                print(f"True phases: {true_phases.cpu().numpy().tolist()}")
+                print(f"Feature range: [{features.min():.3f}, {features.max():.3f}]")
+                print(f"Feature std: {features.std():.6f}")
+                print(f"Predicted phases: {predicted.cpu().numpy().tolist()}")
+                
+                # Per-phase feature analysis
+                for phase in torch.unique(true_phases):
+                    mask = true_phases == phase
+                    if mask.sum() > 0:
+                        phase_features = features[mask]
+                        print(f"Phase {phase.item()} features: mean={phase_features.mean():.4f}, std={phase_features.std():.4f}")
         
         # Calculate epoch metrics
         avg_loss = epoch_loss / num_batches
@@ -474,11 +476,34 @@ def train_phase_detector(train_loader, encoder, phase_detector,
         phase_losses.append(avg_loss)
         phase_accuracies.append(accuracy)
         
-        # Update learning rate
-        scheduler.step()
+        # Update learning rates
+        scheduler_encoder.step()
+        scheduler_phase.step()
+        
+        # 🔥 FEATURE QUALITY ANALYSIS
+        if epoch_features:
+            all_features = torch.cat(epoch_features, dim=0)
+            epoch_phases_tensor = torch.tensor(epoch_phases)
+            
+            print(f"\n📊 Epoch {epoch+1} Feature Analysis:")
+            print(f"   Overall feature std: {all_features.std():.6f}")
+            print(f"   Feature range: [{all_features.min():.3f}, {all_features.max():.3f}]")
+            
+            # Inter-phase distances
+            unique_phases_in_epoch = torch.unique(epoch_phases_tensor)
+            for i, p1 in enumerate(unique_phases_in_epoch):
+                for p2 in unique_phases_in_epoch[i+1:]:
+                    mask1 = epoch_phases_tensor == p1
+                    mask2 = epoch_phases_tensor == p2
+                    if mask1.sum() > 0 and mask2.sum() > 0:
+                        feat1 = all_features[mask1].mean(dim=0)
+                        feat2 = all_features[mask2].mean(dim=0)
+                        dist = torch.norm(feat1 - feat2).item()
+                        print(f"   Distance Phase {p1.item()}-{p2.item()}: {dist:.4f}")
         
         # Compute gradient norm for early stopping
-        grad_norm = compute_gradient_norm(phase_detector)
+        grad_norm_encoder = compute_gradient_norm(encoder)
+        grad_norm_phase = compute_gradient_norm(phase_detector)
         
         # Print progress
         improvement = "✅" if accuracy > best_accuracy else "📉"
@@ -486,39 +511,301 @@ def train_phase_detector(train_loader, encoder, phase_detector,
             best_accuracy = accuracy
             best_epoch = epoch
         
-        print(f"Epoch {epoch+1}/{num_epochs}: Loss = {avg_loss:.4f}, Accuracy = {accuracy:.4f} {improvement}")
-        print(f"   Gradient norm: {grad_norm:.6f}, Best accuracy: {best_accuracy:.4f} (epoch {best_epoch+1})")
+        current_lr_encoder = optimizer_encoder.param_groups[0]['lr']
+        current_lr_phase = optimizer_phase.param_groups[0]['lr']
+        
+        print(f"\nEpoch {epoch+1}/{num_epochs}: Loss = {avg_loss:.4f}, Accuracy = {accuracy:.4f} {improvement}")
+        print(f"   Encoder grad norm: {grad_norm_encoder:.6f}, Phase grad norm: {grad_norm_phase:.6f}")
+        print(f"   LR Encoder: {current_lr_encoder:.2e}, LR Phase: {current_lr_phase:.2e}")
+        print(f"   Best accuracy: {best_accuracy:.4f} (epoch {best_epoch+1})")
         
         # Early stopping check
-        if early_stopping(avg_loss, phase_detector, epoch, grad_norm):
-            print(f"🛑 Phase detector training stopped early!")
+        if early_stopping(avg_loss, phase_detector, epoch, grad_norm_phase):
+            print(f"🛑 Quick fix training stopped early!")
             early_stopping.restore_weights(phase_detector)
             break
         
         # Save checkpoint if best model
-        if accuracy > best_accuracy - 0.01:  # Save if within 1% of best
-            checkpoint_path = os.path.join(checkpoint_dir, f"phase_detector_best.pth")
+        if accuracy > best_accuracy - 0.01:
+            checkpoint_path = os.path.join(checkpoint_dir, f"quickfix_phase_detector_best.pth")
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': phase_detector.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
+                'encoder_state_dict': encoder.state_dict(),
+                'phase_detector_state_dict': phase_detector.state_dict(),
+                'optimizer_encoder_state_dict': optimizer_encoder.state_dict(),
+                'optimizer_phase_state_dict': optimizer_phase.state_dict(),
                 'accuracy': accuracy,
                 'loss': avg_loss
             }, checkpoint_path)
     
-    # Unfreeze encoder for next phase
+    # Keep encoder unfrozen for next phase
+    print("🔓 Keeping encoder unfrozen for next training phase...")
+    encoder.train()
     for param in encoder.parameters():
         param.requires_grad = True
-    encoder.train()
     
     # Final summary
     final_accuracy = phase_accuracies[-1] if phase_accuracies else 0
-    print(f"\n✅ Optimized phase detector training completed:")
+    print(f"\n✅ Quick fix training completed:")
     print(f"   Final accuracy: {final_accuracy:.4f}")
     print(f"   Best accuracy: {best_accuracy:.4f} (epoch {best_epoch+1})")
-    print(f"   Early stopping summary: {early_stopping.get_summary()}")
+    print(f"   Improvement: {best_accuracy - 0.375:.4f} (vs baseline ~37.5%)")
+    
+    if best_accuracy > 0.6:
+        print("   🎉 SUCCESS: Accuracy > 60%!")
+    elif best_accuracy > 0.5:
+        print("   👍 GOOD: Accuracy > 50%, on right track!")
+    else:
+        print("   ⚠️  STILL LOW: May need data quality check or architecture changes")
     
     return phase_losses, phase_accuracies
+    
+    
+    # """
+    # OPTIMIZED: Phase detector training that accepts train_loader and extracts unique volumes
+    # """
+    # print(f"\n{'='*60}")
+    # print("PHASE 2: OPTIMIZED PHASE DETECTOR TRAINING")
+    # print(f"{'='*60}")
+    
+    # # Extract unique volumes from the train_loader's dataset
+    # print("🔍 Extracting unique volumes from train_loader...")
+    # unique_volumes = {}
+    # phase_counts = defaultdict(int)
+    
+    # # Access the underlying dataset from the DataLoader
+    # dataset = train_loader.dataset
+    
+    # # Extract unique volumes from dataset data
+    # if hasattr(dataset, 'data'):
+    #     # MONAI Dataset stores data in .data attribute
+    #     data_dicts = dataset.data
+    # else:
+    #     # Fallback: try to access through dataset directly
+    #     print("⚠️  Warning: Could not access dataset.data, using alternative method")
+    #     data_dicts = []
+        
+    #     # Alternative: iterate through the loader once to collect unique data
+    #     # This is less efficient but works if dataset.data is not accessible
+    #     temp_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+    #     seen_paths = set()
+        
+    #     for batch in temp_loader:
+    #         input_volume_paths = batch.get("input_volume_meta_dict", {}).get("filename_or_obj", [])
+    #         input_phases = batch["input_phase"]
+    #         scan_ids = batch.get("scan_id", ["unknown"])
+            
+    #         if isinstance(input_volume_paths, (list, tuple)):
+    #             input_volume_path = input_volume_paths[0] if input_volume_paths else "unknown"
+    #         else:
+    #             input_volume_path = str(input_volume_paths)
+            
+    #         if input_volume_path not in seen_paths and input_volume_path != "unknown":
+    #             seen_paths.add(input_volume_path)
+    #             data_dicts.append({
+    #                 "input_volume": input_volume_path,
+    #                 "input_phase": input_phases[0].item() if torch.is_tensor(input_phases[0]) else input_phases[0],
+    #                 "scan_id": scan_ids[0] if isinstance(scan_ids, (list, tuple)) else scan_ids
+    #             })
+    
+    # # Create unique phase detection dataset
+    # for data_dict in data_dicts:
+    #     input_path = data_dict["input_path"]
+    #     input_phase = data_dict["input_phase"]
+    #     scan_id = data_dict.get("scan_id", "unknown")
+        
+    #     # Use path as unique identifier
+    #     if input_path not in unique_volumes:
+    #         unique_volumes[input_path] = {
+    #             "volume": input_path,
+    #             "phase": input_phase,
+    #             "scan_id": scan_id
+    #         }
+    #         phase_counts[input_phase] += 1
+    
+    # unique_data_dicts = list(unique_volumes.values())
+    
+    # print(f"   Original pairs in loader: {len(data_dicts)}")
+    # print(f"   Unique volumes extracted: {len(unique_data_dicts)}")
+    # print(f"   Phase distribution:")
+    
+    # phase_names = {0: 'Non-contrast', 1: 'Arterial', 2: 'Venous', 3: 'Delayed'}
+    # for phase, count in sorted(phase_counts.items()):
+    #     phase_name = phase_names.get(phase, f'Phase_{phase}')
+    #     print(f"     {phase_name}: {count} volumes")
+    
+    # # Create phase detection DataLoader
+    # from data import prepare_phase_detection_data
+    # phase_loader = prepare_phase_detection_data(
+    #     unique_data_dicts, batch_size=4, spatial_size=spatial_size
+    # )
+    
+    # # Setup early stopping
+    # early_stopping = AdvancedEarlyStopping(
+    #     patience=15,
+    #     min_delta=1e-4,
+    #     oscillation_patience=10,
+    #     oscillation_threshold=0.005,
+    #     restore_best_weights=True
+    # )
+    
+    # # Freeze encoder
+    # encoder.eval()
+    # for param in encoder.parameters():
+    #     param.requires_grad = False
+    
+    # phase_detector.train()
+    
+    # # Analyze class distribution and setup weighted loss
+    # unique_phases = set(phase_counts.keys())
+    # num_classes = len(unique_phases)
+    # print(f"📊 Detected {num_classes} unique phases: {sorted(unique_phases)}")
+    
+    # # Create class weights (this helps with medical data imbalance)
+    # total_samples = len(unique_data_dicts)
+    # class_weights = []
+    # for i in range(max(unique_phases) + 1):  # Ensure we cover all phase indices
+    #     if i in phase_counts:
+    #         weight = total_samples / (num_classes * phase_counts[i])
+    #     else:
+    #         weight = 1.0
+    #     class_weights.append(weight)
+    
+    # # Only keep weights for phases that exist
+    # actual_class_weights = [class_weights[i] for i in sorted(unique_phases)]
+    # class_weights_tensor = torch.tensor(actual_class_weights).to(device)
+    # print(f"   Using class weights: {class_weights_tensor.cpu().numpy()}")
+    
+    # # Loss and optimizer
+    # weighted_loss = nn.CrossEntropyLoss(weight=class_weights_tensor)
+    # optimizer = torch.optim.AdamW(
+    #     phase_detector.parameters(), 
+    #     lr=5e-4, 
+    #     weight_decay=1e-4
+    # )
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    
+    # # Mixed precision
+    # scaler = GradScaler() if use_mixed_precision else None
+    
+    # # Tracking
+    # phase_losses = []
+    # phase_accuracies = []
+    # best_accuracy = 0.0
+    # best_epoch = 0
+    
+    # print(f"🚀 Starting optimized phase detector training...")
+    
+    # for epoch in range(num_epochs):
+    #     epoch_loss = 0.0
+    #     correct_predictions = 0
+    #     total_predictions = 0
+    #     num_batches = 0
+        
+    #     # Training loop
+    #     for batch_idx, batch in enumerate(tqdm(phase_loader, desc=f"Phase Epoch {epoch+1}/{num_epochs}")):
+    #         volumes = batch["volume"].to(device)
+    #         true_phases = batch["phase"].to(device)
+    #         # Debug: Print batch information every 50 batches
+    #         if batch_idx % 50 == 0:
+    #             print(f"\nDEBUG Batch {batch_idx}:")
+    #             print(f"Volume shape: {volumes.shape}")
+    #             print(f"Volume range: [{volumes.min():.3f}, {volumes.max():.3f}]")
+    #             print(f"True phases: {true_phases.tolist()}")
+            
+    #         optimizer.zero_grad()
+            
+    #         with autocast(device_type="cuda", enabled=use_mixed_precision):
+    #             # Extract features (frozen encoder)
+    #             with torch.no_grad():
+    #                 features = encoder(volumes).detach()
+    #                 # Debug: Print feature information every 50 batches
+    #                 if batch_idx % 50 == 0:
+    #                     print(f"Feature shape: {features.shape}")
+    #                     print(f"Feature range: [{features.min():.3f}, {features.max():.3f}]")
+                
+    #             # Phase prediction
+    #             phase_logits = phase_detector(features)
+    #             # Debug: Print prediction information every 50 batches
+    #             if batch_idx % 50 == 0:
+    #                 print(f"Logits shape: {phase_logits.shape}")
+    #                 print(f"Logits sample:\n{phase_logits[0].tolist()}")
+    #                 _, predicted = torch.max(phase_logits, 1)
+    #                 print(f"Predicted phases: {predicted.tolist()}")
+                
+    #             loss = weighted_loss(phase_logits, true_phases)
+            
+    #         # Backward pass
+    #         if use_mixed_precision:
+    #             scaler.scale(loss).backward()
+    #             scaler.unscale_(optimizer)
+    #             torch.nn.utils.clip_grad_norm_(phase_detector.parameters(), max_norm=1.0)
+    #             scaler.step(optimizer)
+    #             scaler.update()
+    #         else:
+    #             loss.backward()
+    #             torch.nn.utils.clip_grad_norm_(phase_detector.parameters(), max_norm=1.0)
+    #             optimizer.step()
+            
+    #         # Track metrics
+    #         epoch_loss += loss.item()
+    #         _, predicted = torch.max(phase_logits, 1)
+    #         correct_predictions += (predicted == true_phases).sum().item()
+    #         total_predictions += true_phases.size(0)
+    #         num_batches += 1
+        
+    #     # Calculate epoch metrics
+    #     avg_loss = epoch_loss / num_batches
+    #     accuracy = correct_predictions / total_predictions
+        
+    #     phase_losses.append(avg_loss)
+    #     phase_accuracies.append(accuracy)
+        
+    #     # Update learning rate
+    #     scheduler.step()
+        
+    #     # Compute gradient norm for early stopping
+    #     grad_norm = compute_gradient_norm(phase_detector)
+        
+    #     # Print progress
+    #     improvement = "✅" if accuracy > best_accuracy else "📉"
+    #     if accuracy > best_accuracy:
+    #         best_accuracy = accuracy
+    #         best_epoch = epoch
+        
+    #     print(f"Epoch {epoch+1}/{num_epochs}: Loss = {avg_loss:.4f}, Accuracy = {accuracy:.4f} {improvement}")
+    #     print(f"   Gradient norm: {grad_norm:.6f}, Best accuracy: {best_accuracy:.4f} (epoch {best_epoch+1})")
+        
+    #     # Early stopping check
+    #     if early_stopping(avg_loss, phase_detector, epoch, grad_norm):
+    #         print(f"🛑 Phase detector training stopped early!")
+    #         early_stopping.restore_weights(phase_detector)
+    #         break
+        
+    #     # Save checkpoint if best model
+    #     if accuracy > best_accuracy - 0.01:  # Save if within 1% of best
+    #         checkpoint_path = os.path.join(checkpoint_dir, f"phase_detector_best.pth")
+    #         torch.save({
+    #             'epoch': epoch,
+    #             'model_state_dict': phase_detector.state_dict(),
+    #             'optimizer_state_dict': optimizer.state_dict(),
+    #             'accuracy': accuracy,
+    #             'loss': avg_loss
+    #         }, checkpoint_path)
+    
+    # # Unfreeze encoder for next phase
+    # for param in encoder.parameters():
+    #     param.requires_grad = True
+    # encoder.train()
+    
+    # # Final summary
+    # final_accuracy = phase_accuracies[-1] if phase_accuracies else 0
+    # print(f"\n✅ Optimized phase detector training completed:")
+    # print(f"   Final accuracy: {final_accuracy:.4f}")
+    # print(f"   Best accuracy: {best_accuracy:.4f} (epoch {best_epoch+1})")
+    # print(f"   Early stopping summary: {early_stopping.get_summary()}")
+    
+    # return phase_losses, phase_accuracies
 
 def train_disentangled_generation(train_loader, encoder, generator, discriminator, phase_detector, validation_loader=None,
                                  num_epochs=50, device="cuda", use_mixed_precision=True, checkpoint_dir="checkpoints"):
@@ -593,8 +880,8 @@ def train_disentangled_generation(train_loader, encoder, generator, discriminato
         print(f"Disentanglement Epoch {epoch+1}/{num_epochs} (λ_adv = {lambda_adv:.3f}, λ_phase = {lambda_phase:.3f})")
         
         for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Disentangle Epoch {epoch+1}")):
-            input_volume = batch["input_volume"].to(device)
-            target_volume = batch["target_volume"].to(device)
+            input_volume = batch["input_path"].to(device)
+            target_volume = batch["target_path"].to(device)
             target_phase = batch["target_phase"].to(device)
             true_phase = batch["input_phase"].to(device)
             
@@ -1107,8 +1394,8 @@ def run_validation(validation_loader, encoder, generator, discriminator, phase_d
     
     with torch.no_grad():
         for batch in tqdm(validation_loader, desc="Validation"):
-            input_volume = batch["input_volume"].to(device)
-            target_volume = batch["target_volume"].to(device)
+            input_volume = batch["input_path"].to(device)
+            target_volume = batch["target_path"].to(device)
             target_phase = batch["target_phase"].to(device)
             true_phase = batch["input_phase"].to(device)
             

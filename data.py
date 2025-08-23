@@ -448,6 +448,11 @@ def create_phase_detection_dataset(data_dicts):
     
     print(f"🔍 Creating unique phase detection dataset...")
     
+    # Debug: Print first few entries of input data
+    print("\nDEBUG: First 3 input data_dicts:")
+    for i, d in enumerate(data_dicts[:3]):
+        print(f"Entry {i}: {d}")
+    
     unique_volumes = {}
     phase_counts = defaultdict(int)
     
@@ -464,6 +469,11 @@ def create_phase_detection_dataset(data_dicts):
                 "scan_id": scan_id
             }
             phase_counts[input_phase] += 1
+    
+    # Debug: Print first few unique volumes
+    print("\nDEBUG: First 3 unique volumes:")
+    for i, (path, data) in enumerate(list(unique_volumes.items())[:3]):
+        print(f"Volume {i}: Path={path}, Phase={data['phase']}, ID={data['scan_id']}")
     
     print(f"   Original pairs: {len(data_dicts)}")
     print(f"   Unique volumes: {len(unique_volumes)}")

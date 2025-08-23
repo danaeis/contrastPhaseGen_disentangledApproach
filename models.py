@@ -371,9 +371,14 @@ class Discriminator(nn.Module):
         return self.model(x).view(-1, 1)  # (batch, 1)
 
 
+
 class PhaseDetector(nn.Module):
     def __init__(self, latent_dim=256, num_phases=4, dropout_rate=0.3):
         super().__init__()
+        print(f"\nDEBUG: Initializing PhaseDetector")
+        print(f"Latent dim: {latent_dim}")
+        print(f"Num phases: {num_phases}")
+        print(f"Dropout rate: {dropout_rate}")
         
         # Input normalization
         self.input_norm = nn.LayerNorm(latent_dim)
@@ -421,6 +426,12 @@ class PhaseDetector(nn.Module):
             torch.nn.init.zeros_(module.bias)
 
     def forward(self, z):
+        # Debug: Print input tensor information
+        if torch.rand(1).item() < 0.01:  # Print for ~1% of forward passes
+            print(f"\nDEBUG PhaseDetector forward:")
+            print(f"Input shape: {z.shape}")
+            print(f"Input range: [{z.min():.3f}, {z.max():.3f}]")
+        
         # Normalize input
         z_norm = self.input_norm(z)
         
@@ -433,6 +444,11 @@ class PhaseDetector(nn.Module):
         pred1 = self.head1(x3)    # From final block
         pred2 = self.head2(x2)    # From middle block
         pred3 = self.head3(z_norm) # Direct from input
+        
+        # Debug: Print intermediate shapes occasionally
+        if torch.rand(1).item() < 0.01:  # Print for ~1% of forward passes
+            print(f"Block outputs - x1: {x1.shape}, x2: {x2.shape}, x3: {x3.shape}")
+            print(f"Predictions - pred1: {pred1.shape}, pred2: {pred2.shape}, pred3: {pred3.shape}")
         
         # Combine predictions
         combined = torch.cat([pred1, pred2, pred3], dim=1)

@@ -6,6 +6,14 @@ from data import prepare_data, prepare_dataset_from_folders
 from training import train_contrast_phase_generation  # Updated training function
 from inference import benchmark_inference, generate_contrast_phase, save_volume
 from medViT_encoder import create_medvit_encoder
+# Add at the top of main.py
+try:
+    from monai_totalseg_encoder import create_monai_totalsegmentator_encoder
+    MONAI_TOTALSEG_AVAILABLE = True
+    print("✅ MONAI TotalSegmentator encoder available")
+except ImportError:
+    MONAI_TOTALSEG_AVAILABLE = False
+    print("❌ MONAI TotalSegmentator encoder not available")
 
 def debug_generator_dimensions(encoder, args):
     """Debug function to identify dimension mismatches"""
@@ -49,7 +57,7 @@ def main():
     
     # Encoder/model options
     parser.add_argument("--encoder", type=str, default="medvit", 
-                        choices=["simple_cnn", "timm_vit", "resnet3d", "medvit", "hybrid"], 
+                        choices=["simple_cnn", "timm_vit", "resnet3d", "medvit", "hybrid", "monai_totalseg"], 
                         help="Encoder backbone")
     parser.add_argument("--spatial_size", type=int, nargs=3, default=[128,128,128], 
                         help="Input volume size D H W after resize")
@@ -84,6 +92,10 @@ def main():
     parser.add_argument('--timm_model_name', type=str, default='vit_small_patch16_224', help='Timm ViT model name')
     parser.add_argument('--timm_pretrained', action='store_true', help='Use pretrained weights for Timm model')
     
+    # ADD these new TotalSegmentator-specific arguments:
+    parser.add_argument('--totalseg_roi_size', type=int, nargs=3, default=[96, 96, 96], help='ROI size for TotalSegmentator sliding window')
+    parser.add_argument('--totalseg_enhanced', action='store_true', help='Use enhanced anatomical features')
+
     # Training phase control arguments
     parser.add_argument('--force_encoder_pretrain', action='store_true', help='Force encoder pretraining even for pretrained models')
     parser.add_argument('--skip_phase_detector', action='store_true', help='Skip phase detector training (use if already trained)')
@@ -130,7 +142,46 @@ def main():
         encoder_type = get_encoder_type_from_args(args)
         encoder_config_for_save = None
         
-        if args.encoder == "medvit":
+        if args.encoder == "monai_totalseg":
+            if not MONAI_TOTALSEG_AVAILABLE:
+                print("❌ MONAI TotalSegmentator not available, falling back to simple_cnn")
+                encoder = Simple3DCNNEncoder(
+                    in_channels=1,
+                    latent_dim=args.latent_dim,
+                    img_size=img_size
+                )
+                encoder_config_for_save = {
+                    'type': 'simple_cnn', 
+                    'config': {
+                        'in_channels': 1,
+                        'latent_dim': args.latent_dim,
+                        'img_size': img_size
+                    }
+                }
+            else:
+                totalseg_config = {
+                    'latent_dim': args.latent_dim,
+                    'device': args.device,
+                    'roi_size': tuple(args.totalseg_roi_size),
+                    'use_enhanced_features': args.totalseg_enhanced,
+                    'use_pretrained': True,
+                    'sw_batch_size': 2,  # Conservative for memory
+                    'overlap': 0.25,
+                    'img_size': img_size
+                }
+                
+                print(f"🔧 MONAI TotalSegmentator configuration:")
+                print(f"   Latent dim: {args.latent_dim}")
+                print(f"   ROI size: {args.totalseg_roi_size}")
+                print(f"   Enhanced: {args.totalseg_enhanced}")
+                
+                encoder = create_monai_totalsegmentator_encoder(totalseg_config)
+                encoder_config_for_save = {
+                    'type': 'monai_totalseg', 
+                    'config': totalseg_config
+                }
+
+        elif args.encoder == "medvit":
             # MedViT configuration
             medvit_config = {
                 'model_size': args.medvit_size,
@@ -276,7 +327,9 @@ def main():
         )
         
         print("🎉 Training complete!")
-        
+        if args.encoder == "monai_totalseg" and hasattr(encoder, 'cleanup'):
+            print("🧹 Cleaning up MONAI TotalSegmentator resources...")
+            encoder.cleanup()
         # Print final metrics summary
         print(f"\n📊 Final Training Summary:")
         if 'pretrain_losses' in metrics and metrics['pretrain_losses']:
@@ -315,6 +368,8 @@ def main():
             encoder_config = encoder_info['config']
             
             print(f"🏗️  Loading {encoder_type} encoder from checkpoint...")
+
+            
             
             if encoder_type == 'medvit':
                 encoder = create_medvit_encoder(encoder_config)
@@ -326,6 +381,12 @@ def main():
                 encoder = ResNet3DEncoder(**encoder_config)
             elif encoder_type == 'hybrid':
                 encoder = LightweightHybridEncoder(**encoder_config)
+            elif encoder_type == 'monai_totalseg':
+                if not MONAI_TOTALSEG_AVAILABLE:
+                    print("❌ MONAI TotalSegmentator not available for checkpoint loading")
+                    return
+                encoder = create_monai_totalsegmentator_encoder(encoder_config)
+
             else:
                 raise ValueError(f"Unknown encoder type in checkpoint: {encoder_type}")
                 
