@@ -26,13 +26,13 @@ def debug_generator_dimensions(encoder, args):
     dummy_input = torch.randn(1, 1, *args.spatial_size)
     
     with torch.no_grad():
-        encoder_output = encoder(dummy_input)
+        encoder_output = encoder(dummy_input).to(args.device)
         print(f"Encoder output shape: {encoder_output.shape}")
         print(f"Encoder latent_dim: {encoder_output.shape[-1]}")
     
     # Test phase embedding
     from utils import get_phase_embedding
-    phase_emb = get_phase_embedding(0, dim=32, device='cpu')
+    phase_emb = get_phase_embedding(0, dim=32, device=args.device)
     print(f"Phase embedding shape: {phase_emb.shape}")
     
     # Combined input to generator
@@ -53,7 +53,7 @@ def main():
     parser.add_argument("--data_path", type=str, default="data", help="Path to data directory")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory for saving checkpoints")
     parser.add_argument("--batch_size", type=int, default=2, help="Batch size for training")
-    parser.add_argument("--epochs", type=int, default=150, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=80, help="Number of training epochs")
     
     # Encoder/model options
     parser.add_argument("--encoder", type=str, default="medvit", 
@@ -93,7 +93,7 @@ def main():
     parser.add_argument('--timm_pretrained', action='store_true', help='Use pretrained weights for Timm model')
     
     # ADD these new TotalSegmentator-specific arguments:
-    parser.add_argument('--totalseg_roi_size', type=int, nargs=3, default=[96, 96, 96], help='ROI size for TotalSegmentator sliding window')
+    parser.add_argument('--totalseg_roi_size', type=int, nargs=3, default=[32, 32, 32], help='ROI size for TotalSegmentator sliding window')
     parser.add_argument('--totalseg_enhanced', action='store_true', help='Use enhanced anatomical features')
 
     # Training phase control arguments

@@ -412,16 +412,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 📚 Citation
 
-If you use this work in your research, please cite:
 
-```bibtex
-@article{ct_contrast_generation,
-  title={Deep Learning for CT Contrast Phase Generation using Disentangled Representations},
-  author={Your Name},
-  journal={Medical Image Analysis},
-  year={2024}
-}
-```
 
 ## 🙏 Acknowledgments
 

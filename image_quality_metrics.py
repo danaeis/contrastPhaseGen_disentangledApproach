@@ -506,8 +506,8 @@ def run_validation_with_metrics(validation_loader,
             
             try:
                 # Get batch data
-                input_volume = batch["input_volume"].to(device)
-                target_volume = batch["target_volume"].to(device)
+                input_volume = batch["input_path"].to(device)
+                target_volume = batch["target_path"].to(device)
                 target_phase = batch["target_phase"].to(device)
                 
                 # Forward pass

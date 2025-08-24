@@ -159,9 +159,9 @@ def check_gradient_flow(model, model_name):
     if zero_grad_count > param_count * 0.5:
         print(f"   ⚠️  WARNING: Many zero gradients in {model_name}!")
 
-def pretrain_encoder_generator(train_loader, encoder, generator, phase_detector, num_epochs=30, device="cuda", use_mixed_precision=True):
+def pretrain_encoder_generator(train_loader, encoder, generator, phase_detector, num_epochs=30, device="cuda", use_mixed_precision=True, validation_loader=None, checkpoint_dir="checkpoints"):
     """
-    FIXED Phase 1: Pretrain encoder and generator with reconstruction loss
+    FIXED Phase 1: Pretrain encoder and generator with reconstruction loss and image quality metrics
     """
     print(f"\n{'='*60}")
     print("PHASE 1: ENCODER + GENERATOR PRETRAINING (FIXED)")
@@ -171,35 +171,51 @@ def pretrain_encoder_generator(train_loader, encoder, generator, phase_detector,
     encoder.train()
     generator.train()
     
-    # FIXED: Use MSE loss instead of L1 for better gradient flow
+    # Initialize loss and optimizers
     reconstruction_loss = nn.MSELoss()
-    print("line 160")
-    # FIXED: Lower learning rates for more stable training
     optimizer_enc = optim.Adam(encoder.parameters(), lr=1e-4, weight_decay=1e-5)
     optimizer_gen = optim.Adam(generator.parameters(), lr=1e-4, weight_decay=1e-5)
-    print("line 164")
-    # FIXED: Add learning rate scheduler
+    
+    # Learning rate schedulers
     scheduler_enc = optim.lr_scheduler.ReduceLROnPlateau(optimizer_enc, patience=5, factor=0.5)
     scheduler_gen = optim.lr_scheduler.ReduceLROnPlateau(optimizer_gen, patience=5, factor=0.5)
-    print("line 168")
+    
     # Mixed precision
     scaler = GradScaler() if use_mixed_precision else None
     
+    # Initialize early stopping
+    early_stopping = AdvancedEarlyStopping(
+        patience=5,
+        min_delta=1e-4,
+        oscillation_patience=3,
+        oscillation_threshold=0.005,
+        restore_best_weights=True
+    )
+    
+    # Initialize metrics tracker
+    metrics_tracker = ValidationMetricsTracker(
+        save_path=os.path.join(checkpoint_dir, "pretrain_metrics.csv"),
+        metrics_list=['psnr', 'ssim', 'ms_ssim', 'nmse', 'ncc', 'mi']
+    )
+    
     pretrain_losses = []
     best_loss = float('inf')
+    best_psnr = 0.0
+    best_ssim = 0.0
     
     # Debug first batch
     debug_batch = next(iter(train_loader))
     debug_data_flow(debug_batch, encoder, generator, phase_detector, device)
-    print("line 178")
+    
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         num_batches = 0
         
+        encoder.train()
+        generator.train()
+        
         for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Pretrain Epoch {epoch+1}/{num_epochs}")):
             input_volume = batch["input_path"].to(device)
-            input_phase = batch["input_phase"].to(device)
-            # FIXED: Use target volume as reconstruction target
             target_volume = batch["target_path"].to(device)
             target_phase = batch["target_phase"].to(device)
             
@@ -210,51 +226,43 @@ def pretrain_encoder_generator(train_loader, encoder, generator, phase_detector,
                 # Encode input
                 z = encoder(input_volume)
                 
-                # FIXED: Use target phase instead of random phase for better learning
+                # Create phase embeddings
                 phase_emb = create_phase_embeddings(target_phase, dim=32, device=device)
                 
                 # Generate volume
                 reconstructed_volume = generator(z, phase_emb)
                 
-                # FIXED: Ensure same data range for loss computation
-                # Clamp both to [0, 1] range
+                # Ensure same data range for loss computation
                 reconstructed_volume = torch.clamp(reconstructed_volume, 0, 1)
                 target_volume = torch.clamp(target_volume, 0, 1)
                 
                 # Reconstruction loss
                 loss = reconstruction_loss(reconstructed_volume, target_volume)
                 
-                # FIXED: Add regularization term to prevent mode collapse
-                # Encourage encoder to produce diverse features
+                # Regularization to prevent mode collapse
                 z_var = torch.var(z, dim=0).mean()
-                reg_loss = -0.01 * z_var  # Negative to encourage variance
+                reg_loss = -0.01 * z_var
                 
                 total_loss = loss + reg_loss
             
             # Backward pass
             if use_mixed_precision:
                 scaler.scale(total_loss).backward()
-                
-                # FIXED: Add gradient clipping
                 scaler.unscale_(optimizer_enc)
                 scaler.unscale_(optimizer_gen)
                 torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
                 torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
-                
                 scaler.step(optimizer_enc)
                 scaler.step(optimizer_gen)
                 scaler.update()
             else:
                 total_loss.backward()
-                
-                # FIXED: Add gradient clipping
                 torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
                 torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
-                
                 optimizer_enc.step()
                 optimizer_gen.step()
             
-            epoch_loss += loss.item()  # Don't include reg_loss in reported loss
+            epoch_loss += loss.item()
             num_batches += 1
             
             # Debug gradient flow every 50 batches
@@ -268,24 +276,82 @@ def pretrain_encoder_generator(train_loader, encoder, generator, phase_detector,
         # Update learning rate
         scheduler_enc.step(avg_loss)
         scheduler_gen.step(avg_loss)
-        # Log learning rate
         current_lr = optimizer_enc.param_groups[0]['lr']
-        print(f"Epoch {epoch+1}/{num_epochs}, Validation Loss: {avg_loss:.4f}, Learning Rate: {current_lr}")
-
-        # Track best loss
+        
+        # Validation with image quality metrics
+        if validation_loader is not None and (epoch + 1) % 5 == 0:
+            encoder.eval()
+            generator.eval()
+            val_metrics = run_validation_with_metrics(
+                validation_loader, encoder, generator, metrics_tracker, device, max_batches=5
+            )
+            
+            print(f"\n📊 Validation Metrics (Epoch {epoch+1}):")
+            print(f"   PSNR: {val_metrics.get('psnr', 0):.4f}")
+            print(f"   SSIM: {val_metrics.get('ssim', 0):.4f}")
+            print(f"   MS-SSIM: {val_metrics.get('ms_ssim', 0):.4f}")
+            print(f"   NMSE: {val_metrics.get('nmse', 0):.6f}")
+            print(f"   NCC: {val_metrics.get('ncc', 0):.4f}")
+            print(f"   MI: {val_metrics.get('mi', 0):.4f}")
+            
+            # Track best metrics
+            current_psnr = val_metrics.get('psnr', 0)
+            current_ssim = val_metrics.get('ssim', 0)
+            
+            if current_psnr > best_psnr:
+                best_psnr = current_psnr
+                torch.save({
+                    'epoch': epoch + 1,
+                    'encoder_state_dict': encoder.state_dict(),
+                    'generator_state_dict': generator.state_dict(),
+                    'psnr': best_psnr,
+                    'metrics': val_metrics
+                }, os.path.join(checkpoint_dir, 'pretrain_best_psnr.pth'))
+                print(f"   🏆 New best PSNR: {best_psnr:.4f}")
+            
+            if current_ssim > best_ssim:
+                best_ssim = current_ssim
+                torch.save({
+                    'epoch': epoch + 1,
+                    'encoder_state_dict': encoder.state_dict(),
+                    'generator_state_dict': generator.state_dict(),
+                    'ssim': best_ssim,
+                    'metrics': val_metrics
+                }, os.path.join(checkpoint_dir, 'pretrain_best_ssim.pth'))
+                print(f"   🏆 New best SSIM: {best_ssim:.4f}")
+            
+            # Update metrics tracker
+            metrics_tracker.update(epoch + 1, val_metrics)
+        
+        # Early stopping check
+        grad_norm = compute_gradient_norm(encoder) + compute_gradient_norm(generator)
+        if early_stopping(avg_loss, generator, epoch, grad_norm):
+            print(f"🛑 Pretraining stopped early!")
+            early_stopping.restore_weights(generator)
+            break
+        
+        # Print progress
+        improvement = "✅" if avg_loss < best_loss else "📉"
         if avg_loss < best_loss:
             best_loss = avg_loss
-            improvement = "✅"
-        else:
-            improvement = "📉"
+            torch.save({
+                'epoch': epoch + 1,
+                'encoder_state_dict': encoder.state_dict(),
+                'generator_state_dict': generator.state_dict(),
+                'loss': best_loss
+            }, os.path.join(checkpoint_dir, 'pretrain_best_loss.pth'))
         
-        print(f"Pretrain Epoch {epoch+1}: Reconstruction Loss = {avg_loss:.6f} {improvement}")
+        print(f"Pretrain Epoch {epoch+1}: Reconstruction Loss = {avg_loss:.6f} {improvement}, LR: {current_lr:.2e}")
         
-        # FIXED: Early stopping if loss is not improving
-        if epoch > 10 and avg_loss > pretrain_losses[-5]:  # No improvement in 5 epochs
+        # Warning for no improvement
+        if epoch > 10 and avg_loss > pretrain_losses[-5]:
             print(f"   ⚠️  Loss not improving, consider checking data or model")
     
-    print(f"✓ Encoder + Generator pretraining completed (Best: {best_loss:.6f})")
+    # Save final metrics summary
+    metrics_tracker.print_summary()
+    metrics_tracker.save_summary_json(os.path.join(checkpoint_dir, 'pretrain_metrics_summary.json'))
+    
+    print(f"\n✓ Encoder + Generator pretraining completed (Best Loss: {best_loss:.6f}, Best PSNR: {best_psnr:.4f}, Best SSIM: {best_ssim:.4f})")
     return pretrain_losses
 
 def train_phase_detector(train_loader, encoder, phase_detector, 
@@ -328,9 +394,9 @@ def train_phase_detector(train_loader, encoder, phase_detector,
     
     # Setup early stopping
     early_stopping = AdvancedEarlyStopping(
-        patience=15,
+        patience=5,
         min_delta=1e-4,
-        oscillation_patience=10,
+        oscillation_patience=3,
         oscillation_threshold=0.005,
         restore_best_weights=True
     )
@@ -559,253 +625,6 @@ def train_phase_detector(train_loader, encoder, phase_detector,
         print("   ⚠️  STILL LOW: May need data quality check or architecture changes")
     
     return phase_losses, phase_accuracies
-    
-    
-    # """
-    # OPTIMIZED: Phase detector training that accepts train_loader and extracts unique volumes
-    # """
-    # print(f"\n{'='*60}")
-    # print("PHASE 2: OPTIMIZED PHASE DETECTOR TRAINING")
-    # print(f"{'='*60}")
-    
-    # # Extract unique volumes from the train_loader's dataset
-    # print("🔍 Extracting unique volumes from train_loader...")
-    # unique_volumes = {}
-    # phase_counts = defaultdict(int)
-    
-    # # Access the underlying dataset from the DataLoader
-    # dataset = train_loader.dataset
-    
-    # # Extract unique volumes from dataset data
-    # if hasattr(dataset, 'data'):
-    #     # MONAI Dataset stores data in .data attribute
-    #     data_dicts = dataset.data
-    # else:
-    #     # Fallback: try to access through dataset directly
-    #     print("⚠️  Warning: Could not access dataset.data, using alternative method")
-    #     data_dicts = []
-        
-    #     # Alternative: iterate through the loader once to collect unique data
-    #     # This is less efficient but works if dataset.data is not accessible
-    #     temp_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
-    #     seen_paths = set()
-        
-    #     for batch in temp_loader:
-    #         input_volume_paths = batch.get("input_volume_meta_dict", {}).get("filename_or_obj", [])
-    #         input_phases = batch["input_phase"]
-    #         scan_ids = batch.get("scan_id", ["unknown"])
-            
-    #         if isinstance(input_volume_paths, (list, tuple)):
-    #             input_volume_path = input_volume_paths[0] if input_volume_paths else "unknown"
-    #         else:
-    #             input_volume_path = str(input_volume_paths)
-            
-    #         if input_volume_path not in seen_paths and input_volume_path != "unknown":
-    #             seen_paths.add(input_volume_path)
-    #             data_dicts.append({
-    #                 "input_volume": input_volume_path,
-    #                 "input_phase": input_phases[0].item() if torch.is_tensor(input_phases[0]) else input_phases[0],
-    #                 "scan_id": scan_ids[0] if isinstance(scan_ids, (list, tuple)) else scan_ids
-    #             })
-    
-    # # Create unique phase detection dataset
-    # for data_dict in data_dicts:
-    #     input_path = data_dict["input_path"]
-    #     input_phase = data_dict["input_phase"]
-    #     scan_id = data_dict.get("scan_id", "unknown")
-        
-    #     # Use path as unique identifier
-    #     if input_path not in unique_volumes:
-    #         unique_volumes[input_path] = {
-    #             "volume": input_path,
-    #             "phase": input_phase,
-    #             "scan_id": scan_id
-    #         }
-    #         phase_counts[input_phase] += 1
-    
-    # unique_data_dicts = list(unique_volumes.values())
-    
-    # print(f"   Original pairs in loader: {len(data_dicts)}")
-    # print(f"   Unique volumes extracted: {len(unique_data_dicts)}")
-    # print(f"   Phase distribution:")
-    
-    # phase_names = {0: 'Non-contrast', 1: 'Arterial', 2: 'Venous', 3: 'Delayed'}
-    # for phase, count in sorted(phase_counts.items()):
-    #     phase_name = phase_names.get(phase, f'Phase_{phase}')
-    #     print(f"     {phase_name}: {count} volumes")
-    
-    # # Create phase detection DataLoader
-    # from data import prepare_phase_detection_data
-    # phase_loader = prepare_phase_detection_data(
-    #     unique_data_dicts, batch_size=4, spatial_size=spatial_size
-    # )
-    
-    # # Setup early stopping
-    # early_stopping = AdvancedEarlyStopping(
-    #     patience=15,
-    #     min_delta=1e-4,
-    #     oscillation_patience=10,
-    #     oscillation_threshold=0.005,
-    #     restore_best_weights=True
-    # )
-    
-    # # Freeze encoder
-    # encoder.eval()
-    # for param in encoder.parameters():
-    #     param.requires_grad = False
-    
-    # phase_detector.train()
-    
-    # # Analyze class distribution and setup weighted loss
-    # unique_phases = set(phase_counts.keys())
-    # num_classes = len(unique_phases)
-    # print(f"📊 Detected {num_classes} unique phases: {sorted(unique_phases)}")
-    
-    # # Create class weights (this helps with medical data imbalance)
-    # total_samples = len(unique_data_dicts)
-    # class_weights = []
-    # for i in range(max(unique_phases) + 1):  # Ensure we cover all phase indices
-    #     if i in phase_counts:
-    #         weight = total_samples / (num_classes * phase_counts[i])
-    #     else:
-    #         weight = 1.0
-    #     class_weights.append(weight)
-    
-    # # Only keep weights for phases that exist
-    # actual_class_weights = [class_weights[i] for i in sorted(unique_phases)]
-    # class_weights_tensor = torch.tensor(actual_class_weights).to(device)
-    # print(f"   Using class weights: {class_weights_tensor.cpu().numpy()}")
-    
-    # # Loss and optimizer
-    # weighted_loss = nn.CrossEntropyLoss(weight=class_weights_tensor)
-    # optimizer = torch.optim.AdamW(
-    #     phase_detector.parameters(), 
-    #     lr=5e-4, 
-    #     weight_decay=1e-4
-    # )
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-    
-    # # Mixed precision
-    # scaler = GradScaler() if use_mixed_precision else None
-    
-    # # Tracking
-    # phase_losses = []
-    # phase_accuracies = []
-    # best_accuracy = 0.0
-    # best_epoch = 0
-    
-    # print(f"🚀 Starting optimized phase detector training...")
-    
-    # for epoch in range(num_epochs):
-    #     epoch_loss = 0.0
-    #     correct_predictions = 0
-    #     total_predictions = 0
-    #     num_batches = 0
-        
-    #     # Training loop
-    #     for batch_idx, batch in enumerate(tqdm(phase_loader, desc=f"Phase Epoch {epoch+1}/{num_epochs}")):
-    #         volumes = batch["volume"].to(device)
-    #         true_phases = batch["phase"].to(device)
-    #         # Debug: Print batch information every 50 batches
-    #         if batch_idx % 50 == 0:
-    #             print(f"\nDEBUG Batch {batch_idx}:")
-    #             print(f"Volume shape: {volumes.shape}")
-    #             print(f"Volume range: [{volumes.min():.3f}, {volumes.max():.3f}]")
-    #             print(f"True phases: {true_phases.tolist()}")
-            
-    #         optimizer.zero_grad()
-            
-    #         with autocast(device_type="cuda", enabled=use_mixed_precision):
-    #             # Extract features (frozen encoder)
-    #             with torch.no_grad():
-    #                 features = encoder(volumes).detach()
-    #                 # Debug: Print feature information every 50 batches
-    #                 if batch_idx % 50 == 0:
-    #                     print(f"Feature shape: {features.shape}")
-    #                     print(f"Feature range: [{features.min():.3f}, {features.max():.3f}]")
-                
-    #             # Phase prediction
-    #             phase_logits = phase_detector(features)
-    #             # Debug: Print prediction information every 50 batches
-    #             if batch_idx % 50 == 0:
-    #                 print(f"Logits shape: {phase_logits.shape}")
-    #                 print(f"Logits sample:\n{phase_logits[0].tolist()}")
-    #                 _, predicted = torch.max(phase_logits, 1)
-    #                 print(f"Predicted phases: {predicted.tolist()}")
-                
-    #             loss = weighted_loss(phase_logits, true_phases)
-            
-    #         # Backward pass
-    #         if use_mixed_precision:
-    #             scaler.scale(loss).backward()
-    #             scaler.unscale_(optimizer)
-    #             torch.nn.utils.clip_grad_norm_(phase_detector.parameters(), max_norm=1.0)
-    #             scaler.step(optimizer)
-    #             scaler.update()
-    #         else:
-    #             loss.backward()
-    #             torch.nn.utils.clip_grad_norm_(phase_detector.parameters(), max_norm=1.0)
-    #             optimizer.step()
-            
-    #         # Track metrics
-    #         epoch_loss += loss.item()
-    #         _, predicted = torch.max(phase_logits, 1)
-    #         correct_predictions += (predicted == true_phases).sum().item()
-    #         total_predictions += true_phases.size(0)
-    #         num_batches += 1
-        
-    #     # Calculate epoch metrics
-    #     avg_loss = epoch_loss / num_batches
-    #     accuracy = correct_predictions / total_predictions
-        
-    #     phase_losses.append(avg_loss)
-    #     phase_accuracies.append(accuracy)
-        
-    #     # Update learning rate
-    #     scheduler.step()
-        
-    #     # Compute gradient norm for early stopping
-    #     grad_norm = compute_gradient_norm(phase_detector)
-        
-    #     # Print progress
-    #     improvement = "✅" if accuracy > best_accuracy else "📉"
-    #     if accuracy > best_accuracy:
-    #         best_accuracy = accuracy
-    #         best_epoch = epoch
-        
-    #     print(f"Epoch {epoch+1}/{num_epochs}: Loss = {avg_loss:.4f}, Accuracy = {accuracy:.4f} {improvement}")
-    #     print(f"   Gradient norm: {grad_norm:.6f}, Best accuracy: {best_accuracy:.4f} (epoch {best_epoch+1})")
-        
-    #     # Early stopping check
-    #     if early_stopping(avg_loss, phase_detector, epoch, grad_norm):
-    #         print(f"🛑 Phase detector training stopped early!")
-    #         early_stopping.restore_weights(phase_detector)
-    #         break
-        
-    #     # Save checkpoint if best model
-    #     if accuracy > best_accuracy - 0.01:  # Save if within 1% of best
-    #         checkpoint_path = os.path.join(checkpoint_dir, f"phase_detector_best.pth")
-    #         torch.save({
-    #             'epoch': epoch,
-    #             'model_state_dict': phase_detector.state_dict(),
-    #             'optimizer_state_dict': optimizer.state_dict(),
-    #             'accuracy': accuracy,
-    #             'loss': avg_loss
-    #         }, checkpoint_path)
-    
-    # # Unfreeze encoder for next phase
-    # for param in encoder.parameters():
-    #     param.requires_grad = True
-    # encoder.train()
-    
-    # # Final summary
-    # final_accuracy = phase_accuracies[-1] if phase_accuracies else 0
-    # print(f"\n✅ Optimized phase detector training completed:")
-    # print(f"   Final accuracy: {final_accuracy:.4f}")
-    # print(f"   Best accuracy: {best_accuracy:.4f} (epoch {best_epoch+1})")
-    # print(f"   Early stopping summary: {early_stopping.get_summary()}")
-    
-    # return phase_losses, phase_accuracies
 
 def train_disentangled_generation(train_loader, encoder, generator, discriminator, phase_detector, validation_loader=None,
                                  num_epochs=50, device="cuda", use_mixed_precision=True, checkpoint_dir="checkpoints"):
@@ -823,12 +642,12 @@ def train_disentangled_generation(train_loader, encoder, generator, discriminato
     phase_detector.train()
     # Setup early stopping for each model
     early_stopping = ModelSpecificEarlyStopping()
-    early_stopping.add_model('generator', patience=20, min_delta=1e-5, restore_best_weights=True)
-    early_stopping.add_model('discriminator', patience=25, min_delta=1e-5, restore_best_weights=False)
-    early_stopping.add_model('overall', patience=30, min_delta=1e-6, restore_best_weights=False)
+    early_stopping.add_model('generator', patience=4, min_delta=1e-5, restore_best_weights=True)
+    early_stopping.add_model('discriminator', patience=4, min_delta=1e-5, restore_best_weights=False)
+    early_stopping.add_model('overall', patience=4, min_delta=1e-6, restore_best_weights=False)
     
     metrics_tracker = ValidationMetricsTracker(
-        save_path=os.path.join(checkpoint_dir, 'validation_metrics.csv')
+        save_path=os.path.join(checkpoint_dir, f"{encoder}_validation_metrics.csv")
     )
     # FIXED: Better loss functions
     l1_loss = nn.L1Loss()
@@ -851,8 +670,8 @@ def train_disentangled_generation(train_loader, encoder, generator, discriminato
     )
     
     # FIXED: Add learning rate schedulers
-    scheduler_enc_gen = optim.lr_scheduler.ReduceLROnPlateau(optimizer_enc_gen, patience=10, factor=0.8)
-    scheduler_disc = optim.lr_scheduler.ReduceLROnPlateau(optimizer_disc, patience=10, factor=0.8)
+    scheduler_enc_gen = optim.lr_scheduler.ReduceLROnPlateau(optimizer_enc_gen, patience=5, factor=0.8)
+    scheduler_disc = optim.lr_scheduler.ReduceLROnPlateau(optimizer_disc, patience=5, factor=0.8)
     
     # Mixed precision
     scaler = GradScaler() if use_mixed_precision else None
@@ -865,8 +684,8 @@ def train_disentangled_generation(train_loader, encoder, generator, discriminato
     
     for epoch in range(num_epochs):
         # FIXED: More gradual ramp-up for stability
-        lambda_adv = min(1.0, (epoch + 1) / 30)  # Ramp up over 30 epochs
-        lambda_phase = min(0.5, (epoch + 1) / 40)  # Even more gradual for phase loss
+        lambda_adv = min(1.0, (epoch + 1) / 15)  # Ramp up over 30 epochs
+        lambda_phase = min(0.5, (epoch + 1) / 20)  # Even more gradual for phase loss
         
         epoch_g_loss = 0.0
         epoch_d_loss = 0.0
@@ -1168,7 +987,7 @@ def train_contrast_phase_generation(
     generator,
     discriminator,
     phase_detector,
-    num_epochs=150,
+    num_epochs=80,
     device="cuda",
     checkpoint_dir="checkpoints",
     use_mixed_precision=True,
@@ -1215,12 +1034,12 @@ def train_contrast_phase_generation(
     # Phase allocation
     if has_pretrained:
         # Skip encoder pretraining for pretrained models
-        phase_detector_epochs = 40
+        phase_detector_epochs = 20
         disentanglement_epochs = num_epochs - phase_detector_epochs
     else:
         # Include encoder pretraining
-        encoder_pretrain_epochs = 30
-        phase_detector_epochs = 40
+        encoder_pretrain_epochs = 15
+        phase_detector_epochs = 20
         disentanglement_epochs = num_epochs - encoder_pretrain_epochs - phase_detector_epochs
     
     print(f"\n📋 Training phases:")
@@ -1516,61 +1335,3 @@ def save_metrics_to_csv(metrics, checkpoint_dir):
         json.dump(summary, f, indent=2)
     
     print(f"📋 Training summary saved to: {summary_path}")
-
-
-    # """Save training metrics to CSV file"""
-    # csv_path = os.path.join(checkpoint_dir, 'training_metrics.csv')
-    
-    # # Determine maximum length for alignment
-    # max_len = max([
-    #     len(metrics.get("pretrain_losses", [])),
-    #     len(metrics.get("phase_losses", [])),
-    #     len(metrics.get("g_losses", [])),
-    #     len(metrics.get("d_losses", [])),
-    #     len(metrics.get("p_losses", []))
-    # ])
-    
-    # with open(csv_path, 'w', newline='') as csvfile:
-    #     fieldnames = ['epoch', 'phase', 'pretrain_loss', 'phase_detector_loss', 
-    #                  'phase_accuracy', 'generator_loss', 'discriminator_loss', 
-    #                  'final_phase_loss', 'final_phase_accuracy']
-    #     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-    #     writer.writeheader()
-        
-    #     # Write pretraining metrics
-    #     for i, loss in enumerate(metrics.get("pretrain_losses", [])):
-    #         writer.writerow({
-    #             'epoch': i + 1,
-    #             'phase': 'encoder_pretraining',
-    #             'pretrain_loss': loss
-    #         })
-        
-    #     # Write phase detector metrics
-    #     phase_losses = metrics.get("phase_losses", [])
-    #     phase_accs = metrics.get("phase_accuracies", [])
-    #     for i in range(len(phase_losses)):
-    #         writer.writerow({
-    #             'epoch': len(metrics.get("pretrain_losses", [])) + i + 1,
-    #             'phase': 'phase_detector',
-    #             'phase_detector_loss': phase_losses[i],
-    #             'phase_accuracy': phase_accs[i] if i < len(phase_accs) else 0
-    #         })
-        
-    #     # Write disentanglement metrics
-    #     g_losses = metrics.get("g_losses", [])
-    #     d_losses = metrics.get("d_losses", [])
-    #     final_p_losses = metrics.get("p_losses", [])[len(phase_losses):]  # Skip phase detector losses
-    #     final_p_accs = metrics.get("final_phase_accuracies", [])
-        
-    #     for i in range(len(g_losses)):
-    #         base_epoch = len(metrics.get("pretrain_losses", [])) + len(phase_losses)
-    #         writer.writerow({
-    #             'epoch': base_epoch + i + 1,
-    #             'phase': 'disentangled_generation',
-    #             'generator_loss': g_losses[i] if i < len(g_losses) else 0,
-    #             'discriminator_loss': d_losses[i] if i < len(d_losses) else 0,
-    #             'final_phase_loss': final_p_losses[i] if i < len(final_p_losses) else 0,
-    #             'final_phase_accuracy': final_p_accs[i] if i < len(final_p_accs) else 0
-    #         })
-    
-    # print(f"📊 Metrics saved to: {csv_path}")
