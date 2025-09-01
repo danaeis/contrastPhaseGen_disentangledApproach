@@ -5,7 +5,7 @@ from models import Simple3DCNNEncoder, TimmViTEncoder, ResNet3DEncoder, Lightwei
 from data import prepare_data, prepare_dataset_from_folders
 from training import train_contrast_phase_generation
 from inference import benchmark_inference, generate_contrast_phase, save_volume
-from medViT_encoder import create_medvit_encoder
+from arc_medViT_encoder import create_medvit_encoder
 
 def debug_generator_dimensions(encoder, args):
     """Debug function to identify dimension mismatches"""

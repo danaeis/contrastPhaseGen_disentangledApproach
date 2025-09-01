@@ -178,7 +178,7 @@ def test_all_encoders():
     
     # 5. MedViT
     try:
-        from medViT_encoder import create_medvit_encoder
+        from arc_medViT_encoder import create_medvit_encoder
         
         # Special handling for MedViT factory function
         def medvit_wrapper(**config):

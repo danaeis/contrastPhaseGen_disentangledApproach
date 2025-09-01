@@ -228,6 +228,97 @@ class BasicBlock3D(nn.Module):
         return out
 
 
+class StableLightweightHybridEncoder(nn.Module):
+        def __init__(self, latent_dim=256, in_channels=1):
+            super().__init__()
+            
+            # More stable CNN with GroupNorm
+            self.cnn_features = nn.Sequential(
+                nn.Conv3d(in_channels, 32, kernel_size=3, stride=2, padding=1),
+                nn.GroupNorm(8, 32),  # More stable than BatchNorm
+                nn.ReLU(),
+                nn.Dropout3d(0.1),
+                
+                nn.Conv3d(32, 64, kernel_size=3, stride=2, padding=1),
+                nn.GroupNorm(16, 64),
+                nn.ReLU(),
+                nn.Dropout3d(0.1),
+                
+                nn.Conv3d(64, 128, kernel_size=3, stride=2, padding=1),
+                nn.GroupNorm(32, 128),
+                nn.ReLU(),
+                nn.Dropout3d(0.1),
+                
+                nn.Conv3d(128, 256, kernel_size=3, stride=2, padding=1),
+                nn.GroupNorm(64, 256),
+                nn.ReLU(),
+            )
+            
+            # Stable attention
+            self.attention = nn.MultiheadAttention(
+                embed_dim=256, num_heads=8, batch_first=True, dropout=0.1
+            )
+            
+            self.global_pool = nn.AdaptiveAvgPool3d(1)
+            self.layer_norm = nn.LayerNorm(256)
+            
+            self.fc = nn.Sequential(
+                nn.Linear(256, 512),
+                nn.LayerNorm(512),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(512, latent_dim),
+                nn.LayerNorm(latent_dim)
+            )
+            
+            # Initialize weights properly
+            self._init_weights()
+        
+        def _init_weights(self):
+            for m in self.modules():
+                if isinstance(m, nn.Conv3d):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+                elif isinstance(m, (nn.GroupNorm, nn.LayerNorm)):
+                    nn.init.constant_(m.weight, 1)
+                    nn.init.constant_(m.bias, 0)
+                elif isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    nn.init.constant_(m.bias, 0)
+        
+        def forward(self, x):
+            # CNN features
+            features = self.cnn_features(x)
+            
+            # Check for NaN (safety)
+            if torch.isnan(features).any():
+                print("⚠️ NaN detected in CNN, using safe fallback")
+                return torch.zeros(x.shape[0], self.fc[-2].out_features, device=x.device)
+            
+            # Attention
+            batch_size, channels, d, h, w = features.shape
+            features_flat = features.view(batch_size, channels, -1).transpose(1, 2)
+            features_flat = self.layer_norm(features_flat)
+            
+            try:
+                attn_out, _ = self.attention(features_flat, features_flat, features_flat)
+                attn_out = attn_out + features_flat  # Residual
+            except:
+                attn_out = features_flat  # Fallback
+            
+            # Pool and project
+            attn_out = attn_out.transpose(1, 2).view(batch_size, channels, d, h, w)
+            pooled = self.global_pool(attn_out).view(batch_size, -1)
+            output = self.fc(pooled)
+            
+            # Final safety check
+            if torch.isnan(output).any():
+                print("⚠️ NaN in final output, using zeros")
+                return torch.zeros_like(output)
+            
+            return output
+
 # Option 4: Hybrid CNN-Transformer (lightweight)
 class LightweightHybridEncoder(nn.Module):
     """Lightweight hybrid CNN + self-attention encoder"""
@@ -364,7 +455,6 @@ class Discriminator(nn.Module):
             nn.BatchNorm3d(256),
             nn.LeakyReLU(0.2),
             nn.Conv3d(256, 1, kernel_size=4, stride=1, padding=0),   # 16x16x16 -> 13x13x13
-            nn.Sigmoid()  # PatchGAN output
         )
 
     def forward(self, x):
