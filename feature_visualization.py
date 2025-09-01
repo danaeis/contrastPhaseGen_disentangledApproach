@@ -25,7 +25,7 @@ from datetime import datetime
 warnings.filterwarnings('ignore')
 
 # Import project modules
-from models import TimmViTEncoder
+from models import TimmViTEncoder, DinoV3Encoder
 from medViT_encoder import create_medvit_encoder
 from data import prepare_dataset_from_folders, prepare_data
 

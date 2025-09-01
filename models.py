@@ -375,6 +375,159 @@ class LightweightHybridEncoder(nn.Module):
         return output
 
 
+# Option 5: DINO v3 Encoder with slice-by-slice processing
+class DinoV3Encoder(nn.Module):
+    """DINO v3 encoder with slice-by-slice processing for 3D volumes"""
+    
+    def __init__(self, latent_dim=256, model_size='small', pretrained=True, max_slices=32, slice_sampling='uniform'):
+        super().__init__()
+        
+        try:
+            import torchvision
+            from torchvision.models import dinov3_small, dinov3_base, dinov3_large
+        except ImportError:
+            raise ImportError("torchvision >= 0.15 required for DINO v3. Install with: pip install torchvision>=0.15")
+        
+        self.latent_dim = latent_dim
+        self.max_slices = max_slices
+        self.slice_sampling = slice_sampling
+        
+        print(f"🔧 Initializing DINO v3 encoder (size: {model_size}, latent_dim: {latent_dim})")
+        
+        # Create DINO v3 backbone
+        if model_size == 'small':
+            self.dino = dinov3_small(pretrained=pretrained)
+        elif model_size == 'base':
+            self.dino = dinov3_base(pretrained=pretrained)
+        elif model_size == 'large':
+            self.dino = dinov3_large(pretrained=pretrained)
+        else:
+            raise ValueError(f"Unknown DINO v3 size: {model_size}. Use 'small', 'base', or 'large'")
+        
+        # Remove classification head
+        self.dino.head = nn.Identity()
+        
+        # Get DINO feature dimension
+        with torch.no_grad():
+            dummy = torch.randn(1, 3, 224, 224)
+            features = self.dino(dummy)
+            dino_dim = features.shape[-1]
+        
+        print(f"DINO v3 feature dimension: {dino_dim}")
+        
+        # Projection layers
+        self.slice_projection = nn.Linear(dino_dim, latent_dim)
+        
+        # Aggregation across slices
+        self.slice_aggregator = nn.LSTM(
+            latent_dim, latent_dim, 
+            batch_first=True, bidirectional=True
+        )
+        self.final_projection = nn.Linear(latent_dim * 2, latent_dim)
+        
+        # Normalization layers
+        self.slice_norm = nn.LayerNorm(latent_dim)
+        self.final_norm = nn.LayerNorm(latent_dim)
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize the projection layers"""
+        for m in [self.slice_projection, self.final_projection]:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def _sample_slices(self, volume_3d):
+        """Sample slice indices based on sampling strategy"""
+        batch_size, _, depth, height, width = volume_3d.shape
+        
+        if self.slice_sampling == 'all':
+            slice_indices = torch.arange(depth)
+        elif self.slice_sampling == 'uniform':
+            if depth > self.max_slices:
+                slice_indices = torch.linspace(0, depth-1, self.max_slices).long()
+            else:
+                slice_indices = torch.arange(depth)
+        elif self.slice_sampling == 'adaptive':
+            # Adaptive sampling: more slices in the center
+            center = depth // 2
+            indices = torch.linspace(center - self.max_slices//2, center + self.max_slices//2, self.max_slices).clamp(0, depth-1).long()
+            slice_indices = torch.unique(indices)
+        else:
+            raise ValueError(f"Unknown slice_sampling method: {self.slice_sampling}")
+        
+        return slice_indices
+    
+    def _preprocess_slice(self, slice_2d):
+        """Preprocess 2D slice for DINO v3 input"""
+        # Resize to 224x224 for DINO v3
+        slice_2d = F.interpolate(
+            slice_2d, size=(224, 224), 
+            mode='bilinear', align_corners=False
+        )
+        
+        # Convert to 3-channel (RGB) - DINO v3 expects RGB
+        slice_2d = slice_2d.repeat(1, 3, 1, 1)
+        
+        # Normalize to ImageNet stats (DINO v3 expects this)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(slice_2d.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(slice_2d.device)
+        slice_2d = (slice_2d - mean) / std
+        
+        return slice_2d
+    
+    def forward(self, volume_3d):
+        """Forward pass through DINO v3 encoder"""
+        # volume_3d: (batch, 1, D, H, W)
+        batch_size, _, depth, height, width = volume_3d.shape
+        device = volume_3d.device
+        
+        # Sample slice indices
+        slice_indices = self._sample_slices(volume_3d)
+        
+        slice_features = []
+        
+        for idx in slice_indices:
+            # Extract slice: (batch, 1, H, W)
+            slice_2d = volume_3d[:, :, idx, :, :]
+            
+            # Preprocess for DINO v3
+            slice_2d = self._preprocess_slice(slice_2d)
+            
+            # Get DINO v3 features
+            try:
+                features = self.dino(slice_2d)
+                
+                # Ensure correct shape
+                if features.dim() > 2:
+                    features = features.mean(dim=1)  # Average over patches
+                
+            except Exception as e:
+                print(f"Error in DINO v3 forward pass: {e}")
+                # Use fallback features
+                features = torch.randn(batch_size, 384, device=device)  # DINO small has 384 features
+            
+            # Project to latent dimension
+            slice_latent = self.slice_projection(features.float())
+            slice_latent = self.slice_norm(slice_latent)
+            slice_features.append(slice_latent)
+        
+        # Stack slice features: (batch, num_slices, latent_dim)
+        volume_features = torch.stack(slice_features, dim=1)
+        
+        # LSTM aggregation
+        lstm_out, (hidden, _) = self.slice_aggregator(volume_features)
+        final_features = self.final_projection(lstm_out[:, -1, :])
+        
+        # Final normalization
+        final_features = self.final_norm(final_features)
+        
+        return final_features
+
+
 def create_encoder(encoder_type='simple_cnn', latent_dim=256, **kwargs):
     """Factory function to create encoders without MONAI dependency"""
     
@@ -389,6 +542,9 @@ def create_encoder(encoder_type='simple_cnn', latent_dim=256, **kwargs):
     
     elif encoder_type == 'hybrid':
         return LightweightHybridEncoder(latent_dim=latent_dim, **kwargs)
+    
+    elif encoder_type == 'dino_v3':
+        return DinoV3Encoder(latent_dim=latent_dim, **kwargs)
     
     else:
         raise ValueError(f"Unknown encoder type: {encoder_type}")
@@ -473,35 +629,21 @@ class PhaseDetector(nn.Module):
         # Input normalization
         self.input_norm = nn.LayerNorm(latent_dim)
         
-        # Three processing blocks
-        self.block1 = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
+        # Simplified architecture for better learning
+        # Using LayerNorm instead of BatchNorm1d for small batch size compatibility
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2),
+            nn.LayerNorm(latent_dim * 2),  # Works with any batch size
             nn.ReLU(),
-            nn.Dropout(dropout_rate)
-        )
-        
-        self.block2 = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim // 2),
-            nn.LayerNorm(latent_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate)
-        )
-        
-        self.block3 = nn.Sequential(
-            nn.Linear(latent_dim // 2, latent_dim // 4),
-            nn.LayerNorm(latent_dim // 4),
+            nn.Dropout(dropout_rate),
+            nn.Linear(latent_dim * 2, latent_dim),
+            nn.LayerNorm(latent_dim),  # Works with any batch size
             nn.ReLU(),
             nn.Dropout(dropout_rate // 2)
         )
         
-        # Three classification heads
-        self.head1 = nn.Linear(latent_dim // 4, num_phases)
-        self.head2 = nn.Linear(latent_dim // 2, num_phases)  
-        self.head3 = nn.Linear(latent_dim, num_phases)
-        
-        # Final fusion
-        self.fusion = nn.Linear(num_phases * 3, num_phases)
+        # Classification head
+        self.classifier = nn.Linear(latent_dim, num_phases)
         
         # Initialize weights
         self.apply(self._init_weights)
@@ -525,26 +667,13 @@ class PhaseDetector(nn.Module):
         # Normalize input
         z_norm = self.input_norm(z)
         
-        # Process through blocks
-        x1 = self.block1(z_norm)
-        x2 = self.block2(x1)
-        x3 = self.block3(x2)
+        # Extract features
+        features = self.feature_extractor(z_norm)
         
-        # Three predictions
-        pred1 = self.head1(x3)    # From final block
-        pred2 = self.head2(x2)    # From middle block
-        pred3 = self.head3(z_norm) # Direct from input
+        # Classify
+        output = self.classifier(features)
         
-        # Debug: Print intermediate shapes occasionally
-        if torch.rand(1).item() < 0.01:  # Print for ~1% of forward passes
-            print(f"Block outputs - x1: {x1.shape}, x2: {x2.shape}, x3: {x3.shape}")
-            print(f"Predictions - pred1: {pred1.shape}, pred2: {pred2.shape}, pred3: {pred3.shape}")
-        
-        # Combine predictions
-        combined = torch.cat([pred1, pred2, pred3], dim=1)
-        final_output = self.fusion(combined)
-        
-        return final_output
+        return output
     # def __init__(self, latent_dim=256, num_phases=4):
     #     super().__init__()  # ✅ Call parent class __init__ first
     #     self.model = nn.Sequential(

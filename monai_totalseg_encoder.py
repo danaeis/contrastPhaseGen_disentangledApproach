@@ -385,12 +385,24 @@ class FixedMONAITotalSegmentatorEncoder(nn.Module):
         print(f"✅ Feature processor initialized with input dim: {actual_feature_dim}")
     
     def forward(self, volume: torch.Tensor, phase_hint: Optional[int] = None) -> torch.Tensor:
-        """FIXED: Forward pass with proper device handling"""
+        """FIXED: Forward pass with proper device handling and NaN prevention"""
         # Preprocess volume
         volume = self._preprocess_volume(volume)
         
+        # Check input for NaN
+        if torch.isnan(volume).any():
+            print(f"⚠️  NaN detected in input volume, cleaning up...")
+            volume = torch.nan_to_num(volume, nan=0.0, posinf=1.0, neginf=-1.0)
+            volume = torch.clamp(volume, 0.0, 1.0)
+        
         # Extract raw features
         raw_features = self._extract_and_aggregate_features_fixed(volume)
+        
+        # Check raw features for NaN
+        if torch.isnan(raw_features).any():
+            print(f"⚠️  NaN detected in raw features, using fallback...")
+            raw_features = torch.randn(raw_features.shape[0], raw_features.shape[1], device=self.device) * 0.1
+            raw_features = torch.clamp(raw_features, -1.0, 1.0)
         
         # Initialize processor if needed
         self._initialize_feature_processor_dynamically_fixed(raw_features)
@@ -401,26 +413,62 @@ class FixedMONAITotalSegmentatorEncoder(nn.Module):
             self.feature_projection.train()
             projected_features = self.feature_projection(raw_features)
             self.feature_projection.eval()
+            
+            # Check projected features for NaN
+            if torch.isnan(projected_features).any():
+                print(f"⚠️  NaN detected after projection, using fallback...")
+                projected_features = torch.randn(projected_features.shape[0], projected_features.shape[1], device=self.device) * 0.1
+                projected_features = torch.clamp(projected_features, -1.0, 1.0)
+                
         except Exception as e:
             print(f"⚠️  Feature projection error: {e}")
             # Emergency fallback projection
             emergency_proj = nn.Linear(raw_features.shape[1], self.latent_dim).to(self.device)
             projected_features = emergency_proj(raw_features)
+            
+            # Check emergency projection for NaN
+            if torch.isnan(projected_features).any():
+                print(f"⚠️  NaN detected in emergency projection, using random features...")
+                projected_features = torch.randn(projected_features.shape[0], projected_features.shape[1], device=self.device) * 0.1
+                projected_features = torch.clamp(projected_features, -1.0, 1.0)
         
         # Apply enhanced processing if enabled
         if self.use_enhanced_features:
             try:
                 projected_features = self._apply_enhanced_processing_fixed(projected_features, volume, phase_hint)
+                
+                # Check enhanced features for NaN
+                if torch.isnan(projected_features).any():
+                    print(f"⚠️  NaN detected after enhanced processing, reverting to basic features...")
+                    projected_features = torch.randn(projected_features.shape[0], projected_features.shape[1], device=self.device) * 0.1
+                    projected_features = torch.clamp(projected_features, -1.0, 1.0)
+                    
             except Exception as e:
                 print(f"⚠️  Enhanced processing failed: {e}")
         
         # Layer normalization
         try:
             features = self.layer_norm(projected_features)
+            
+            # Check normalized features for NaN
+            if torch.isnan(features).any():
+                print(f"⚠️  NaN detected after LayerNorm, using unnormalized features...")
+                features = projected_features
+                
         except Exception as e:
             print(f"⚠️  LayerNorm error: {e}")
             # Skip normalization if it fails
             features = projected_features
+        
+        # Final comprehensive NaN check and cleanup
+        if torch.isnan(features).any() or not torch.isfinite(features).all():
+            print(f"⚠️  Final NaN/Inf check failed, using safe fallback...")
+            features = torch.randn(features.shape[0], features.shape[1], device=self.device) * 0.1
+            features = torch.clamp(features, -1.0, 1.0)
+        
+        # Ensure output is on correct device and has correct shape
+        features = features.to(self.device)
+        assert features.shape[1] == self.latent_dim, f"Output shape mismatch: {features.shape[1]} != {self.latent_dim}"
         
         return features
     

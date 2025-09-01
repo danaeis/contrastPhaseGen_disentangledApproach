@@ -38,6 +38,16 @@ def create_encoder(args):
             'class': StableLightweightHybridEncoder,
             'params': {'latent_dim': args.latent_dim, 'in_channels': 1}
         },
+        'dino_v3': {
+            'class': DinoV3Encoder,
+            'params': {
+                'latent_dim': args.latent_dim,
+                'model_size': getattr(args, 'dino_v3_size', 'small'),
+                'pretrained': getattr(args, 'dino_v3_pretrained', True),
+                'max_slices': getattr(args, 'max_slices', 32),
+                'slice_sampling': 'uniform'
+            }
+        },
         'medvit': {
             'factory': create_medvit_encoder,
             'params': {
@@ -96,7 +106,7 @@ def create_models(args):
     )
     
     discriminator = Discriminator(input_shape=(*img_size, 1))
-    phase_detector = PhaseDetector(latent_dim=args.latent_dim, num_phases=4)
+    phase_detector = PhaseDetector(latent_dim=args.latent_dim, num_phases=3)
     
     return encoder, generator, discriminator, phase_detector, encoder_config
 
@@ -258,7 +268,7 @@ def main():
     
     # Model arguments  
     parser.add_argument("--encoder", type=str, default="simple_cnn", 
-                       choices=["simple_cnn", "timm_vit", "resnet3d", "medvit", "hybrid", "monai_totalseg"])
+                       choices=["simple_cnn", "timm_vit", "resnet3d", "medvit", "hybrid", "dino_v3", "monai_totalseg"])
     parser.add_argument("--latent_dim", type=int, default=256)
     parser.add_argument("--spatial_size", type=int, nargs=3, default=[128, 128, 128])
     
@@ -269,6 +279,8 @@ def main():
     parser.add_argument("--max_slices", type=int, default=32)
     parser.add_argument("--timm_model_name", type=str, default="vit_small_patch16_224")
     parser.add_argument("--timm_pretrained", action="store_true")
+    parser.add_argument("--dino_v3_size", type=str, default="small", choices=["small", "base", "large"])
+    parser.add_argument("--dino_v3_pretrained", action="store_true", default=True, help="Use pretrained DINO v3 weights")
     parser.add_argument("--totalseg_roi_size", type=int, nargs=3, default=[32, 32, 32])
     parser.add_argument("--totalseg_enhanced", action="store_true")
     
