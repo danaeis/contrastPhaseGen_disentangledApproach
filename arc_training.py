@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import os
 from torch.amp import autocast, GradScaler
-from utils import GradientReversalLayer, get_phase_embedding
+from volume_utils import GradientReversalLayer, get_phase_embedding
 import numpy as np
 from tqdm import tqdm
 import csv

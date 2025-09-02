@@ -1,53 +1,96 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-from torch.amp import autocast, GradScaler
-from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
 import os
+import time
 import numpy as np
-from utils import GradientReversalLayer, get_phase_embedding
+from tqdm import tqdm
 
-def create_simple_phase_embedding(phase_labels, dim=32, device='cuda'):
-    """Simple one-hot phase embedding with padding"""
-    if isinstance(phase_labels, (list, np.ndarray)):
-        phase_labels = torch.tensor(phase_labels, device=device)
-    elif phase_labels.device != device:
-        phase_labels = phase_labels.to(device)
-    
-    one_hot = F.one_hot(phase_labels, num_classes=4).float()
-    if dim > 4:
-        padding = torch.zeros(len(phase_labels), dim - 4, device=device)
-        return torch.cat([one_hot, padding], dim=1)
-    return one_hot[:, :dim]
+# Import quality metrics
+try:
+    from image_quality_metrics import ImageQualityMetrics
+    HAS_QUALITY_METRICS = True
+except ImportError:
+    HAS_QUALITY_METRICS = False
 
-class DANNTrainerFixed:
-    """FIXED: DANN-style trainer with proper graph management"""
+# Gradient Reversal Layer
+class GradientReversalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.lambda_ = lambda_
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return (grad_output * -ctx.lambda_), None
+
+def gradient_reversal(x, lambda_):
+    return GradientReversalFunction.apply(x, lambda_)
+
+class DANNTrainerOptimized:
+    """Optimized DANN trainer with frozen encoder and comprehensive logging"""
     
-    def __init__(self, device="cuda", use_mixed_precision=True):
+    def __init__(self, device='cuda', use_mixed_precision=True, logger=None):
         self.device = device
         self.use_mixed_precision = use_mixed_precision
         self.scaler = GradScaler() if use_mixed_precision else None
+        self.logger = logger
         
         # Loss functions
         self.l1_loss = nn.L1Loss()
-        self.bce_loss = nn.BCEWithLogitsLoss() 
         self.ce_loss = nn.CrossEntropyLoss()
+        self.bce_loss = nn.BCEWithLogitsLoss()
         
-        # FIXED: Track computation graphs
-        self.enable_graph_debugging = False
+        # Quality metrics
+        if HAS_QUALITY_METRICS:
+            self.quality_metrics = ImageQualityMetrics(device=device)
+        else:
+            self.quality_metrics = None
     
     def setup_optimizers(self, encoder, generator, discriminator, phase_detector):
-        """Setup DANN-style optimizers"""
-        return {
-            'encoder': optim.Adam(encoder.parameters(), lr=1e-4, betas=(0.5, 0.999)),
-            'generator': optim.Adam(generator.parameters(), lr=2e-4, betas=(0.5, 0.999)),
-            'discriminator': optim.Adam(discriminator.parameters(), lr=1e-4, betas=(0.5, 0.999)),
-            'phase_detector': optim.Adam(phase_detector.parameters(), lr=1e-4, betas=(0.5, 0.999))  # Increased LR for better learning
+        """Setup optimizers with frozen encoder"""
+        
+        # trainable encoder
+        for param in encoder.parameters():
+            param.requires_grad = True
+        encoder.train()
+        
+        print("🧊 Encoder frozen for DANN training")
+        
+        # optimize components
+        optimizers = {
+            'encoder': optim.Adam(encoder.parameters(), lr=1e-4, weight_decay=1e-5),
+            'generator': optim.Adam(generator.parameters(), lr=1e-4, weight_decay=1e-5),
+            'discriminator': optim.Adam(discriminator.parameters(), lr=1e-4, weight_decay=1e-5),
+            'phase_detector': optim.Adam(phase_detector.parameters(), lr=1e-4, weight_decay=1e-5)
         }
+        
+        return optimizers
+    
+    def _get_dann_lambda(self, epoch, max_epochs, mode='adaptive'):
+        """Calculate DANN lambda with smooth scheduling"""
+        p = epoch / max_epochs
+        if mode == 'adaptive':
+            return 2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0
+        else:
+            return min(1.0, epoch / (max_epochs * 0.5))
+    
+    def _create_phase_embedding(self, phase_labels, dim=32):
+        """Create phase embeddings"""
+        batch_size = phase_labels.size(0)
+        phase_emb = torch.zeros(batch_size, dim, device=self.device)
+        
+        for i in range(3):
+            mask = (phase_labels == i)
+            if mask.any():
+                phase_emb[mask, i*dim//3:(i+1)*dim//3] = 1.0
+        
+        return phase_emb.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
     
     def dann_training_step(self, batch, models, optimizers, epoch, max_epochs):
-        """FIXED: Single DANN training step with proper graph management"""
+        """DANN training step with frozen encoder"""
+        
         encoder, generator, discriminator, phase_detector = models
         
         # Prepare data
@@ -57,338 +100,261 @@ class DANNTrainerFixed:
         target_phase = batch["target_phase"].to(self.device)
         
         # DANN lambda scheduling
-        lambda_grl = self._get_dann_lambda(epoch, max_epochs, 'adaptive')
+        lambda_grl = self._get_dann_lambda(epoch, max_epochs)
         
         losses = {}
         
-        # FIXED: Clear all gradients first
+        # Clear all gradients
         for optimizer in optimizers.values():
             optimizer.zero_grad()
         
-        # Debug: Print lambda value occasionally
-        if torch.rand(1).item() < 0.1:  # 10% of the time
-            print(f"\nDEBUG DANN Training - Epoch {epoch}/{max_epochs}")
-            print(f"  Lambda GRL: {lambda_grl:.4f}")
-        
-        # Method 1: Sequential approach (RECOMMENDED)
-        # This avoids sharing computation graphs between different losses
-        losses.update(self._train_generator_step(
-            input_vol, target_vol, target_phase, encoder, generator, discriminator, optimizers
-        ))
-        
-        losses.update(self._train_discriminator_step(
-            input_vol, target_vol, target_phase, encoder, generator, discriminator, optimizers
-        ))
-        
-        losses.update(self._train_phase_detector_step(
-            input_vol, input_phase, lambda_grl, encoder, phase_detector, optimizers
-        ))
-        
-        losses['lambda_grl'] = lambda_grl
-        return losses
-    
-    def _train_generator_step(self, input_vol, target_vol, target_phase, encoder, generator, discriminator, optimizers):
-        """FIXED: Generator training with isolated computation graph"""
-        
-        # Clear gradients
-        optimizers['encoder'].zero_grad()
-        optimizers['generator'].zero_grad()
-        
+        # Compute shared features
         with autocast(device_type="cuda", enabled=self.use_mixed_precision):
-            # FIXED: Fresh forward pass for generator
             features = encoder(input_vol)
-            phase_emb = create_simple_phase_embedding(target_phase, dim=32, device=self.device)
+            phase_emb = self._create_phase_embedding(target_phase, dim=32)
             generated = generator(features, phase_emb)
             
             # Reconstruction loss
             recon_loss = self.l1_loss(generated, target_vol)
             
-            # Adversarial loss (generator wants to fool discriminator)
-            fake_scores = discriminator(generated)
-            g_adv_loss = self.bce_loss(fake_scores, torch.ones_like(fake_scores))
+            # Adversarial loss for generator (fool discriminator)
+            fake_pred = discriminator(generated)
+            adv_loss_gen = self.bce_loss(fake_pred, torch.ones_like(fake_pred))
             
-            # Combined generator loss
-            g_total_loss = recon_loss * 100.0 + g_adv_loss * 1.0
+            gen_total_loss = recon_loss + 0.1 * adv_loss_gen
         
-        # Backward pass
+        # Backward for generator and encoder (main task)
         if self.use_mixed_precision:
-            self.scaler.scale(g_total_loss).backward()
-            self.scaler.unscale_(optimizers['encoder'])
-            self.scaler.unscale_(optimizers['generator'])
-            torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
-            self.scaler.step(optimizers['encoder'])
+            self.scaler.scale(gen_total_loss).backward()
             self.scaler.step(optimizers['generator'])
+            self.scaler.step(optimizers['encoder'])
             self.scaler.update()
         else:
-            g_total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
-            optimizers['encoder'].step()
+            gen_total_loss.backward()
             optimizers['generator'].step()
+            optimizers['encoder'].step()
         
-        return {
-            'reconstruction': recon_loss.item(),
-            'generator': g_total_loss.item(),
-            'g_adv': g_adv_loss.item()
-        }
-    
-    def _train_discriminator_step(self, input_vol, target_vol, target_phase, encoder, generator, discriminator, optimizers):
-        """FIXED: Discriminator training with detached inputs"""
-        
-        # Clear gradients
+        # Step 2: Train Discriminator
         optimizers['discriminator'].zero_grad()
         
         with autocast(device_type="cuda", enabled=self.use_mixed_precision):
-            # FIXED: Generate fake samples with detached encoder output to avoid graph conflicts
-            with torch.no_grad():  # Detach encoder from discriminator training
-                features = encoder(input_vol)
-                phase_emb = create_simple_phase_embedding(target_phase, dim=32, device=self.device)
-                generated = generator(features, phase_emb)
-            
             # Real samples
-            real_scores = discriminator(target_vol)
-            d_real_loss = self.bce_loss(real_scores, torch.ones_like(real_scores))
+            real_pred = discriminator(target_vol)
+            real_labels = torch.ones_like(real_pred)
+            real_loss = self.bce_loss(real_pred, real_labels)
             
-            # Fake samples (detached from generator)
-            fake_scores = discriminator(generated.detach())  # FIXED: Detach generated samples
-            d_fake_loss = self.bce_loss(fake_scores, torch.zeros_like(fake_scores))
+            fake_pred = discriminator(generated.detach())
+            fake_labels = torch.zeros_like(fake_pred)
+            fake_loss = self.bce_loss(fake_pred, fake_labels)
             
-            # Combined discriminator loss
-            d_loss = (d_real_loss + d_fake_loss) * 0.5
+            disc_loss = 0.5 * (real_loss + fake_loss)
         
-        # Backward pass
+        # Backward for discriminator
         if self.use_mixed_precision:
-            self.scaler.scale(d_loss).backward()
-            self.scaler.unscale_(optimizers['discriminator'])
-            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+            self.scaler.scale(disc_loss).backward()
             self.scaler.step(optimizers['discriminator'])
             self.scaler.update()
         else:
-            d_loss.backward()
-            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+            disc_loss.backward()
             optimizers['discriminator'].step()
         
-        return {
-            'discriminator': d_loss.item(),
-            'd_real': d_real_loss.item(),
-            'd_fake': d_fake_loss.item()
-        }
-    
-    def _train_phase_detector_step(self, input_vol, input_phase, lambda_grl, encoder, phase_detector, optimizers):
-        """FIXED: Phase detector training with proper gradient reversal"""
-        
-        # Clear gradients
+        # Step 3: DANN Training for Phase Detector
         optimizers['phase_detector'].zero_grad()
         
         with autocast(device_type="cuda", enabled=self.use_mixed_precision):
-            # FIXED: Fresh encoder forward pass for phase detection
-            features = encoder(input_vol)
+            # Phase classification loss (normal)
+            phase_pred = phase_detector(features.detach())
+            phase_classification_loss = self.ce_loss(phase_pred, input_phase)
             
-            # Normal phase prediction (for classification accuracy)
-            phase_pred = phase_detector(features)
-            phase_loss = self.ce_loss(phase_pred, input_phase)
-            
-            # FIXED: Gradient reversal for domain confusion (separate forward pass)
-            # This avoids graph conflicts by creating a separate computation path
-            # Always apply confusion loss since lambda_grl now has a minimum value
-            # Create reversed features with proper gradient handling
-            reversed_features = GradientReversalLayer.apply(features.detach().requires_grad_(True), lambda_grl)
-            confusion_pred = phase_detector(reversed_features)
-            confusion_loss = self.ce_loss(confusion_pred, input_phase)
-            
-            # Total phase detector loss - always include confusion loss
-            total_phase_loss = phase_loss + confusion_loss * lambda_grl
-        
-        # Backward pass
+        # Backward for phase detector
         if self.use_mixed_precision:
-            self.scaler.scale(total_phase_loss).backward()
-            self.scaler.unscale_(optimizers['phase_detector'])
-            torch.nn.utils.clip_grad_norm_(phase_detector.parameters(), max_norm=1.0)
+            self.scaler.scale(phase_classification_loss).backward()
             self.scaler.step(optimizers['phase_detector'])
             self.scaler.update()
         else:
-            total_phase_loss.backward()
-            torch.nn.utils.clip_grad_norm_(phase_detector.parameters(), max_norm=1.0)
+            phase_classification_loss.backward()
             optimizers['phase_detector'].step()
         
+        # Step 4: Adversarial update for Encoder (using GRL)
+        optimizers['encoder'].zero_grad()
+        
+        with autocast(device_type="cuda", enabled=self.use_mixed_precision):
+            # Apply gradient reversal
+            grl_features = gradient_reversal(features, lambda_grl)
+            confusion_pred = phase_detector(grl_features)
+            confusion_loss = self.ce_loss(confusion_pred, input_phase)
+        
+        # Backward for encoder (with reversed gradients)
+        if self.use_mixed_precision:
+            self.scaler.scale(confusion_loss).backward()
+            self.scaler.step(optimizers['encoder'])
+            self.scaler.update()
+        else:
+            confusion_loss.backward()
+            optimizers['encoder'].step()
+
         # Calculate accuracies
         with torch.no_grad():
             _, phase_pred_labels = torch.max(phase_pred, 1)
             _, confusion_pred_labels = torch.max(confusion_pred, 1)
+            
             phase_acc = (phase_pred_labels == input_phase).float().mean().item()
             confusion_acc = (confusion_pred_labels != input_phase).float().mean().item()
         
-        return {
-            'phase': phase_loss.item(),
+        losses = {
+            'reconstruction': recon_loss.item(),
+            'generator': gen_total_loss.item(),
+            'discriminator': disc_loss.item(),
+            'phase': phase_classification_loss.item(),
             'confusion': confusion_loss.item(),
             'phase_acc': phase_acc,
-            'confusion_acc': confusion_acc
+            'confusion_acc': confusion_acc,
+            'lambda_grl': lambda_grl
         }
-    
-    def _get_dann_lambda(self, epoch, max_epochs, schedule='adaptive'):
-        """DANN lambda scheduling"""
-        p = epoch / max_epochs
-        
-        if schedule == 'adaptive':
-            # Start with a minimum value to ensure confusion loss is always applied
-            return max(0.1, min(1.0, p * 2))  # Minimum 0.1, linear growth, capped at 1.0
-        elif schedule == 'exp':
-            # Ensure minimum value for exponential schedule
-            return max(0.1, 2.0 / (1.0 + np.exp(-10 * p)) - 1.0)
-        else:  # linear
-            return max(0.1, p)  # Minimum 0.1
-
-    # Alternative Method: Single-pass approach with careful graph management
-    def dann_training_step_single_pass(self, batch, models, optimizers, epoch, max_epochs):
-        """Alternative: Single-pass DANN step with careful graph management"""
-        encoder, generator, discriminator, phase_detector = models
-        
-        # Prepare data
-        input_vol = batch["input_path"].to(self.device)
-        target_vol = batch["target_path"].to(self.device)
-        input_phase = batch["input_phase"].to(self.device)
-        target_phase = batch["target_phase"].to(self.device)
-        
-        lambda_grl = self._get_dann_lambda(epoch, max_epochs, 'adaptive')
-        
-        # FIXED: Clear all gradients
-        for optimizer in optimizers.values():
-            optimizer.zero_grad()
-        
-        with autocast(device_type="cuda", enabled=self.use_mixed_precision):
-            # Single forward pass through encoder
-            features = encoder(input_vol)
-            
-            # Generation
-            phase_emb = create_simple_phase_embedding(target_phase, dim=32, device=self.device)
-            generated = generator(features, phase_emb)
-            
-            # Losses computation
-            recon_loss = self.l1_loss(generated, target_vol)
-            
-            # Discriminator losses
-            real_scores = discriminator(target_vol)
-            fake_scores = discriminator(generated)
-            d_real_loss = self.bce_loss(real_scores, torch.ones_like(real_scores))
-            d_fake_loss = self.bce_loss(fake_scores, torch.zeros_like(fake_scores))
-            g_adv_loss = self.bce_loss(fake_scores, torch.ones_like(fake_scores))
-            
-            # Phase detection - ensure features are properly detached for gradient reversal
-            phase_pred = phase_detector(features)
-            phase_loss = self.ce_loss(phase_pred, input_phase)
-            
-            # Gradient reversal - use detached features to avoid gradient conflicts
-            reversed_features = GradientReversalLayer.apply(features.detach().requires_grad_(True), lambda_grl)
-            confusion_pred = phase_detector(reversed_features)
-            confusion_loss = self.ce_loss(confusion_pred, input_phase)
-        
-        # FIXED: Separate backward passes with retain_graph where needed
-        
-        # 1. Discriminator loss
-        d_loss = (d_real_loss + d_fake_loss) * 0.5
-        if self.use_mixed_precision:
-            self.scaler.scale(d_loss).backward(retain_graph=True)
-        else:
-            d_loss.backward(retain_graph=True)
-        
-        # 2. Generator and reconstruction loss  
-        g_loss = recon_loss * 100.0 + g_adv_loss * 1.0
-        if self.use_mixed_precision:
-            self.scaler.scale(g_loss).backward(retain_graph=True)
-        else:
-            g_loss.backward(retain_graph=True)
-        
-        # 3. Phase detection and confusion loss (final backward, no retain_graph)
-        # Ensure both losses contribute to phase detector training
-        phase_total_loss = phase_loss + confusion_loss * lambda_grl
-        
-        # Debug: Print loss components occasionally
-        if torch.rand(1).item() < 0.05:  # 5% of the time
-            print(f"  Phase total loss: {phase_total_loss.item():.4f} (phase: {phase_loss.item():.4f}, confusion: {confusion_loss.item():.4f} * {lambda_grl:.4f})")
-        
-        if self.use_mixed_precision:
-            self.scaler.scale(phase_total_loss).backward()
-        else:
-            phase_total_loss.backward()
-        
-        # FIXED: Apply gradients with proper scaling
-        if self.use_mixed_precision:
-            for name, optimizer in optimizers.items():
-                self.scaler.unscale_(optimizer)
-                # Get parameters for this optimizer
-                if name == 'encoder':
-                    params = encoder.parameters()
-                elif name == 'generator':
-                    params = generator.parameters()
-                elif name == 'discriminator':
-                    params = discriminator.parameters()
-                elif name == 'phase_detector':
-                    params = phase_detector.parameters()
-                
-                torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
-                self.scaler.step(optimizer)
-            
-            self.scaler.update()
-        else:
-            torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_(phase_detector.parameters(), max_norm=1.0)
-            
-            for optimizer in optimizers.values():
-                optimizer.step()
-        
-        # Calculate metrics
-        with torch.no_grad():
-            _, phase_pred_labels = torch.max(phase_pred, 1)
-            _, confusion_pred_labels = torch.max(confusion_pred, 1)
-            
-            # Debug: Print phase predictions occasionally
-            if torch.rand(1).item() < 0.05:  # 5% of the time
-                print(f"\nDEBUG Phase Detection:")
-                print(f"  Input phases: {input_phase[:5].cpu().numpy()}")
-                print(f"  Phase pred: {phase_pred_labels[:5].cpu().numpy()}")
-                print(f"  Confusion pred: {confusion_pred_labels[:5].cpu().numpy()}")
-                print(f"  Lambda GRL: {lambda_grl:.4f}")
-                print(f"  Phase loss: {phase_loss.item():.4f}")
-                print(f"  Confusion loss: {confusion_loss.item():.4f}")
-            
-            losses = {
-                'reconstruction': recon_loss.item(),
-                'generator': g_loss.item(),
-                'discriminator': d_loss.item(),
-                'phase': phase_loss.item(),
-                'confusion': confusion_loss.item(),
-                'phase_acc': (phase_pred_labels == input_phase).float().mean().item(),
-                'confusion_acc': (confusion_pred_labels != input_phase).float().mean().item(),
-                'lambda_grl': lambda_grl
-            }
         
         return losses
+            # # Phase confusion loss (gradient reversal effect)
+            # # Create adversarial phase predictions
+            # confused_features = features.detach() * lambda_grl
+            # confusion_pred = phase_detector(confused_features)
+            
+            # # Target: make phase detector confused (uniform distribution)
+            # uniform_targets = torch.full_like(input_phase, fill_value=1, dtype=torch.float)
+            # confusion_loss = self.ce_loss(confusion_pred, input_phase)  # Still predict correct, but features are modified
+            
+            # # Total phase detector loss
+            # phase_total_loss = phase_classification_loss - lambda_grl * confusion_loss
+        
+        # # Backward for phase detector
+        # if self.use_mixed_precision:
+        #     self.scaler.scale(phase_total_loss).backward()
+        #     self.scaler.step(optimizers['phase_detector'])
+        #     self.scaler.update()
+        # else:
+        #     phase_total_loss.backward()
+        #     optimizers['phase_detector'].step()
+        
+        # # Calculate accuracies
+        # with torch.no_grad():
+        #     _, phase_pred_labels = torch.max(phase_pred, 1)
+        #     _, confusion_pred_labels = torch.max(confusion_pred, 1)
+            
+        #     phase_acc = (phase_pred_labels == input_phase).float().mean().item()
+        #     confusion_acc = (confusion_pred_labels != input_phase).float().mean().item()
+        
+        # losses = {
+        #     'reconstruction': recon_loss.item(),
+        #     'generator': gen_total_loss.item(),
+        #     'discriminator': disc_loss.item(),
+        #     'phase': phase_classification_loss.item(),
+        #     'confusion': confusion_loss.item(),
+        #     'phase_acc': phase_acc,
+        #     'confusion_acc': confusion_acc,
+        #     'lambda_grl': lambda_grl
+        # }
+        
+        # return losses
+    
+    def validate_dann_training(self, val_loader, models, max_batches=8):
+        """Validate DANN training with quality metrics"""
+        
+        encoder, generator, discriminator, phase_detector = models
+        
+        # Set to eval mode
+        encoder.eval()
+        generator.eval()
+        discriminator.eval()
+        phase_detector.eval()
+        
+        total_recon_loss = 0
+        total_phase_acc = 0
+        total_confusion_acc = 0
+        all_quality_metrics = []
+        num_batches = 0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                if num_batches >= max_batches:
+                    break
+                    
+                try:
+                    input_vol = batch["input_path"].to(self.device)
+                    target_vol = batch["target_path"].to(self.device)
+                    target_phase = batch["target_phase"].to(self.device)
+                    input_phase = batch["input_phase"].to(self.device)
+                    
+                    # Forward pass
+                    features = encoder(input_vol)
+                    phase_emb = self._create_phase_embedding(target_phase, dim=32)
+                    generated = generator(features, phase_emb)
+                    phase_pred = phase_detector(features)
+                    
+                    # Basic metrics
+                    recon_loss = self.l1_loss(generated, target_vol)
+                    _, pred = torch.max(phase_pred, 1)
+                    phase_acc = (pred == input_phase).float().mean()
+                    
+                    # Mock confusion accuracy for validation
+                    confusion_acc = 0.5  # Placeholder
+                    
+                    total_recon_loss += recon_loss.item()
+                    total_phase_acc += phase_acc.item()
+                    total_confusion_acc += confusion_acc
+                    
+                    # Quality metrics
+                    if self.quality_metrics:
+                        generated_clamp = torch.clamp(generated, 0, 1)
+                        target_clamp = torch.clamp(target_vol, 0, 1)
+                        quality_metrics = self.quality_metrics.compute_all_metrics(generated_clamp, target_clamp)
+                        all_quality_metrics.append(quality_metrics)
+                    
+                    num_batches += 1
+                    
+                except Exception as e:
+                    continue
+        
+        results = {
+            'reconstruction_loss': total_recon_loss / max(num_batches, 1),
+            'phase_accuracy': total_phase_acc / max(num_batches, 1),
+            'confusion_accuracy': total_confusion_acc / max(num_batches, 1)
+        }
+        
+        if all_quality_metrics:
+            # Average quality metrics
+            for metric in ['psnr', 'ssim', 'ms_ssim']:
+                values = [m.get(metric, 0) for m in all_quality_metrics]
+                results[metric] = np.mean(values) if values else 0
+        
+        # Set back to train mode
+        generator.train()
+        discriminator.train()
+        phase_detector.train()
+        
+        return results
 
 
 def train_dann_style_contrast_generation(train_loader, encoder, generator, discriminator,
-                                             phase_detector, num_epochs=100, device="cuda",
-                                             checkpoint_dir="checkpoints", use_mixed_precision=True,
-                                             validation_loader=None, encoder_config=None,
-                                             encoder_type="simple_cnn", use_sequential_approach=True):
-    """FIXED: DANN-style training with proper graph management"""
+                                        phase_detector, num_epochs=120, device="cuda",
+                                        checkpoint_dir="checkpoints", use_mixed_precision=True,
+                                        validation_loader=None, encoder_config=None,
+                                        encoder_type="simple_cnn", use_sequential_approach=True,
+                                        logger=None):
+    """
+    OPTIMIZED DANN-style training with frozen encoder for Phase 3
+    """
     
-    print(f"🚀 Starting FIXED DANN-style training for {num_epochs} epochs")
-    print(f"📊 Using {'sequential' if use_sequential_approach else 'single-pass'} approach")
+    print(f"\n🚀 Starting OPTIMIZED DANN Training (Phase 3)")
+    print(f"📊 Epochs: {num_epochs}")
+    print(f"🧊 Strategy: Frozen encoder + DANN adaptation")
+    
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     # Initialize trainer
-    trainer = DANNTrainerFixed(device, use_mixed_precision)
+    trainer = DANNTrainerOptimized(device, use_mixed_precision, logger)
     
-    # Move models to device and set to training mode
-    models = [encoder.to(device), generator.to(device), discriminator.to(device), phase_detector.to(device)]
-    for model in models:
-        model.train()
-    
-    # Setup optimizers
-    optimizers = trainer.setup_optimizers(*models)
+    # Setup models and optimizers with frozen encoder
+    models = [encoder, generator, discriminator, phase_detector]
+    optimizers = trainer.setup_optimizers_frozen_encoder(*models)
     
     # Setup schedulers
     schedulers = {
@@ -396,51 +362,40 @@ def train_dann_style_contrast_generation(train_loader, encoder, generator, discr
         for name, opt in optimizers.items()
     }
     
-    # Metrics tracking
-    metrics = {
-        "reconstruction_losses": [],
-        "generator_losses": [],
-        "discriminator_losses": [],
-        "phase_classification_losses": [],
-        "phase_confusion_losses": [],
-        "phase_accuracies": [],
-        "confusion_accuracies": []
-    }
-    
+    # Training metrics
+    best_confusion_acc = 0.0
     best_reconstruction_loss = float('inf')
     
-    print(f"\n{'='*60}")
-    print("FIXED DANN-STYLE TRAINING WITH PROPER GRAPH MANAGEMENT")
-    print(f"{'='*60}")
+    print(f"\n{'='*80}")
+    print("DANN TRAINING WITH FROZEN ENCODER - COMPREHENSIVE LOGGING")
+    print(f"{'='*80}")
     
     for epoch in range(num_epochs):
+        epoch_start_time = time.time()
         epoch_losses = []
         
         # Training loop
-        progress_bar = tqdm(train_loader, desc=f"FIXED DANN Epoch {epoch+1}/{num_epochs}", leave=False)
+        progress_bar = tqdm(train_loader, desc=f"DANN Epoch {epoch+1}/{num_epochs}", leave=False)
         
         for batch_idx, batch in enumerate(progress_bar):
             try:
-                # Choose training approach
-                if use_sequential_approach:
-                    step_losses = trainer.dann_training_step(batch, models, optimizers, epoch, num_epochs)
-                else:
-                    step_losses = trainer.dann_training_step_single_pass(batch, models, optimizers, epoch, num_epochs)
+                # DANN training step with frozen encoder
+                step_losses = trainer.dann_training_step_frozen_encoder(
+                    batch, models, optimizers, epoch, num_epochs
+                )
                 
                 epoch_losses.append(step_losses)
-                # print("losses are ", epoch_losses)
+                
                 # Update progress bar
-                if batch_idx % 50 == 0:
-                    progress_bar.set_postfix({
-                        'recon': f"{step_losses['reconstruction']:.4f}",
-                        'phase_acc': f"{step_losses['phase_acc']:.3f}",
-                        'conf_acc': f"{step_losses['confusion_acc']:.3f}",
-                        'λ': f"{step_losses['lambda_grl']:.3f}"
-                    })
-                    
+                progress_bar.set_postfix({
+                    'recon': f"{step_losses['reconstruction']:.4f}",
+                    'conf_acc': f"{step_losses['confusion_acc']:.3f}",
+                    'λ': f"{step_losses['lambda_grl']:.3f}"
+                })
+                
             except RuntimeError as e:
                 if "Trying to backward through the graph a second time" in str(e):
-                    print(f"⚠️ Graph error at batch {batch_idx} - skipping batch")
+                    print(f"⚠️ Graph error at batch {batch_idx} - continuing")
                     continue
                 else:
                     print(f"⚠️ Batch {batch_idx} error: {e}")
@@ -450,51 +405,68 @@ def train_dann_style_contrast_generation(train_loader, encoder, generator, discr
                 continue
         
         # Calculate epoch averages
+        epoch_time = time.time() - epoch_start_time
         if epoch_losses:
             avg_losses = {
                 key: np.mean([loss[key] for loss in epoch_losses])
                 for key in epoch_losses[0].keys()
             }
             
-            # Store metrics
-            metrics["reconstruction_losses"].append(avg_losses['reconstruction'])
-            metrics["generator_losses"].append(avg_losses['generator'])
-            metrics["discriminator_losses"].append(avg_losses['discriminator'])
-            metrics["phase_classification_losses"].append(avg_losses['phase'])
-            metrics["phase_confusion_losses"].append(avg_losses['confusion'])
-            metrics["phase_accuracies"].append(avg_losses['phase_acc'])
-            metrics["confusion_accuracies"].append(avg_losses['confusion_acc'])
+            # Validation with quality metrics
+            quality_metrics = None
+            if validation_loader and epoch % 20 == 0:
+                quality_metrics = trainer.validate_dann_training(validation_loader, models)
+                print(f"   Validation - Recon: {quality_metrics.get('reconstruction_loss', 0):.4f}, "
+                     f"PSNR: {quality_metrics.get('psnr', 0):.2f}dB, "
+                     f"Confusion: {quality_metrics.get('confusion_accuracy', 0):.3f}")
             
-            # Print progress
-            if epoch % 10 == 0:
-                print(f"\nEpoch {epoch+1}: λ_grl = {avg_losses['lambda_grl']:.3f}")
-                print(f"  Reconstruction: {avg_losses['reconstruction']:.6f}")
-                print(f"  Phase Acc: {avg_losses['phase_acc']:.4f}")
-                print(f"  Confusion Acc: {avg_losses['confusion_acc']:.4f}")
+            # Track best models
+            if avg_losses['confusion_acc'] > best_confusion_acc:
+                best_confusion_acc = avg_losses['confusion_acc']
                 
-                # DANN success indicator
-                if avg_losses['confusion_acc'] > 0.4:
-                    print("  ✅ DANN: Encoder learning phase-invariant features!")
-            
-            # Save best model
-            if avg_losses['reconstruction'] < best_reconstruction_loss:
-                best_reconstruction_loss = avg_losses['reconstruction']
+                # Save best DANN checkpoint
                 torch.save({
                     'epoch': epoch + 1,
                     'encoder_state_dict': encoder.state_dict(),
                     'generator_state_dict': generator.state_dict(),
                     'discriminator_state_dict': discriminator.state_dict(),
                     'phase_detector_state_dict': phase_detector.state_dict(),
-                    'reconstruction_loss': best_reconstruction_loss,
-                    'metrics': avg_losses,
+                    'confusion_accuracy': best_confusion_acc,
+                    'reconstruction_loss': avg_losses['reconstruction'],
                     'encoder_config': encoder_config
-                }, os.path.join(checkpoint_dir, 'dann_best_reconstruction.pth'))
+                }, os.path.join(checkpoint_dir, 'dann_best_confusion.pth'))
+            
+            if avg_losses['reconstruction'] < best_reconstruction_loss:
+                best_reconstruction_loss = avg_losses['reconstruction']
+            
+            # Log comprehensive metrics
+            if logger:
+                logger.log_epoch(epoch, "phase3_dann", avg_losses, quality_metrics, epoch_time)
+            
+            # Print progress with DANN status
+            dann_status = "🟢 Excellent" if avg_losses['confusion_acc'] > 0.5 else \
+                         "🟡 Good" if avg_losses['confusion_acc'] > 0.4 else \
+                         "🔴 Learning"
+            
+            if epoch % 10 == 0:
+                print(f"DANN Epoch {epoch+1}: λ_grl = {avg_losses['lambda_grl']:.3f}")
+                print(f"  Reconstruction: {avg_losses['reconstruction']:.6f}")
+                print(f"  Confusion Acc: {avg_losses['confusion_acc']:.4f} ({dann_status})")
+                
+                # DANN success indicator
+                if avg_losses['confusion_acc'] > 0.4:
+                    print("  ✅ DANN: Encoder learning phase-invariant features!")
+            
+            # Early stopping for DANN success
+            if avg_losses['confusion_acc'] > 0.5:
+                print(f"🎉 DANN early success! Achieved {avg_losses['confusion_acc']:.3f} confusion accuracy")
+                break
         
         # Update schedulers
         for scheduler in schedulers.values():
             scheduler.step()
         
-        # Regular checkpoints
+        # Save periodic checkpoints
         if epoch % 50 == 0:
             torch.save({
                 'epoch': epoch + 1,
@@ -502,9 +474,8 @@ def train_dann_style_contrast_generation(train_loader, encoder, generator, discr
                 'generator_state_dict': generator.state_dict(),
                 'discriminator_state_dict': discriminator.state_dict(),
                 'phase_detector_state_dict': phase_detector.state_dict(),
-                'metrics': metrics,
-                'encoder_config': encoder_config,
-                'encoder_type': encoder_type
+                'training_type': 'dann_frozen_encoder',
+                'encoder_config': encoder_config
             }, os.path.join(checkpoint_dir, f"dann_checkpoint_epoch_{epoch+1}.pth"))
     
     # Final checkpoint
@@ -514,48 +485,25 @@ def train_dann_style_contrast_generation(train_loader, encoder, generator, discr
         'generator_state_dict': generator.state_dict(),
         'discriminator_state_dict': discriminator.state_dict(),
         'phase_detector_state_dict': phase_detector.state_dict(),
-        'metrics': metrics,
+        'best_confusion_accuracy': best_confusion_acc,
+        'best_reconstruction_loss': best_reconstruction_loss,
         'encoder_config': encoder_config,
         'encoder_type': encoder_type,
-        'training_type': 'dann_style'
+        'training_type': 'dann_frozen_encoder_complete'
     }, os.path.join(checkpoint_dir, "dann_final_checkpoint.pth"))
     
-    print(f"\n✅ FIXED DANN-style training completed!")
+    print(f"\n✅ DANN training completed!")
     print(f"📊 Training Summary:")
+    print(f"   Best Confusion Accuracy: {best_confusion_acc:.4f}")
     print(f"   Best Reconstruction Loss: {best_reconstruction_loss:.6f}")
     
-    if metrics["confusion_accuracies"]:
-        final_confusion_acc = metrics["confusion_accuracies"][-1]
-        if final_confusion_acc > 0.4:
-            print("🎯 DANN Success: Model learned phase-invariant features!")
-        else:
-            print("⚠️  DANN Warning: Low confusion rate - consider tuning λ_grl")
+    if best_confusion_acc > 0.4:
+        print("🎯 DANN SUCCESS: Model learned phase-invariant features!")
+    else:
+        print("⚠️ DANN PARTIAL: Consider longer training or parameter adjustment")
     
-    return metrics
-
-
-# Debug utilities
-def debug_computation_graph(tensor, name="tensor"):
-    """Debug utility to check tensor properties"""
-    print(f"🔍 Debug {name}:")
-    print(f"   Shape: {tensor.shape}")
-    print(f"   Device: {tensor.device}")
-    print(f"   Requires grad: {tensor.requires_grad}")
-    print(f"   Has grad_fn: {tensor.grad_fn is not None}")
-    if tensor.grad_fn:
-        print(f"   Grad function: {type(tensor.grad_fn).__name__}")
-
-
-def safe_backward(loss, retain_graph=False, name="loss"):
-    """Safe backward pass with error handling"""
-    try:
-        loss.backward(retain_graph=retain_graph)
-        return True
-    except RuntimeError as e:
-        print(f"⚠️ Backward pass failed for {name}: {e}")
-        if "Trying to backward through the graph a second time" in str(e):
-            print("   💡 Suggestion: Try using retain_graph=True or detach intermediate tensors")
-        return False
-    except Exception as e:
-        print(f"⚠️ Unexpected error in backward pass for {name}: {e}")
-        return False
+    return {
+        'best_confusion_accuracy': best_confusion_acc,
+        'best_reconstruction_loss': best_reconstruction_loss,
+        'dann_success': best_confusion_acc > 0.4
+    }

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.cuda.amp import autocast
-from utils import get_phase_embedding, save_volume
+from volume_utils import get_phase_embedding, save_volume
 import time
 
 def optimize_models_for_inference(encoder, generator, device="cuda"):

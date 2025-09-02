@@ -4,6 +4,7 @@ import torch
 import argparse
 import os
 from models import Simple3DCNNEncoder, TimmViTEncoder, ResNet3DEncoder, LightweightHybridEncoder
+from dino_encoder import DinoV3Encoder
 from models import Generator, Discriminator, PhaseDetector, StableLightweightHybridEncoder
 from data import prepare_data, prepare_dataset_from_folders
 from training import train_contrast_phase_generation
@@ -18,6 +19,7 @@ try:
 except ImportError:
     MONAI_TOTALSEG_AVAILABLE = False
 
+PHASE_DIM = 8
 def create_encoder(args):
     """Unified encoder creation with optimized config handling"""
     encoder_configs = {
@@ -101,7 +103,7 @@ def create_models(args):
     
     generator = Generator(
         latent_dim=args.latent_dim,
-        phase_dim=32,
+        phase_dim=PHASE_DIM,
         output_shape=(*img_size, 1)
     )
     
@@ -154,7 +156,7 @@ def load_checkpoint_and_models(args):
     
     # Create other models
     img_size = tuple(args.spatial_size)
-    generator = Generator(latent_dim=args.latent_dim, phase_dim=32, output_shape=(*img_size, 1))
+    generator = Generator(latent_dim=args.latent_dim, phase_dim=PHASE_DIM, output_shape=(*img_size, 1))
     
     # Load weights
     encoder.load_state_dict(checkpoint['encoder_state_dict'])

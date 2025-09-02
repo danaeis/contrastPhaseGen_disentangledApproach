@@ -349,20 +349,22 @@ def validate_dataset(data_folders, labels_csv, output_csv='dataset_pairs.csv'):
                     continue
                     
                 # Skip registered files
-                if 'registered' in series_file:
+                if 'registered' not in series_file:
                     continue
-                
+
                 # Extract series ID
                 if series_file.endswith('.nii.gz'):
                     series_id = series_file[:-7]  # Remove .nii.gz
                 elif series_file.endswith('.nii'):
                     series_id = series_file[:-4]  # Remove .nii
-                
+                series_id = series_id.replace('registered_', '') if 'registered_' in series_id else series_id.replace('_registered', '')
+                print("series_file", series_id)
                 # Find phase label
                 phase_rows = labels_df[labels_df['SeriesInstanceUID'] == series_id]
                 
                 if len(phase_rows) == 0:
                     missing_labels.append(series_id)
+                    print('len(phase_rows) == 0', series_id)
                     continue
                 
                 phase_label = phase_rows.iloc[0]['Label']

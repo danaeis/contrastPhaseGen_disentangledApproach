@@ -1,0 +1,62 @@
+DINO v3 small Feature Analysis Report
+==================================================
+
+SILHOUETTE SCORE EXPLANATION:
+
+    🎯 SILHOUETTE SCORE EXPLAINED:
+    
+    The Silhouette Score measures how well-separated clusters are in your embedding space.
+    It's crucial for validating whether your learned representations are meaningful.
+    
+    📈 How it works:
+    For each sample point:
+    1. Calculate 'a': Average distance to other points in the SAME cluster (phase)
+    2. Calculate 'b': Average distance to points in the NEAREST other cluster
+    3. Silhouette score for point i: s(i) = (b(i) - a(i)) / max(a(i), b(i))
+    
+    📊 Score interpretation:
+    • +1.0: Perfect clustering (point is much closer to own cluster than others)
+    • +0.5: Good clustering (point is reasonably well-placed)
+    •  0.0: Point is on the border between two clusters
+    • -0.5: Poor clustering (point might be in wrong cluster)
+    • -1.0: Very poor clustering (point is closer to other clusters)
+    
+    🔍 What it tells us about your embeddings:
+    • HIGH silhouette (>0.5): Your encoder learned meaningful phase representations
+    • MEDIUM silhouette (0.2-0.5): Decent separation, some overlap between phases
+    • LOW silhouette (<0.2): Phases are poorly separated - encoder may need improvement
+    
+    ⚠️ Important considerations:
+    • Works best with well-defined, separated clusters
+    • Can be misleading with complex cluster shapes
+    • Compare across different dimensionality reduction methods
+    • Higher dimensions may show different patterns than 2D/3D visualizations
+    
+
+Generated: 2025-09-02 00:33:18
+Model: DINO v3 small
+Latent Dimension: 256
+Total Samples: 524
+Unique Cases: 88
+
+RESULTS:
+
+PCA:
+  2D Silhouette: -0.0869
+  3D Silhouette: -0.0462
+  2D Variance Explained: 0.5026
+  3D Variance Explained: 0.6051
+
+TSNE:
+  2D Silhouette: 0.0186
+  3D Silhouette: 0.0137
+
+LDA:
+  2D Silhouette: 0.9411
+  3D Silhouette: 0.9411
+  2D Variance Explained: 1.0000
+  3D Variance Explained: 1.0000
+
+Best Performance:
+  2D: V3_SMALL_LDA (0.9411)
+  3D: V3_SMALL_LDA (0.9411)

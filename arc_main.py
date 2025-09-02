@@ -23,7 +23,7 @@ def debug_generator_dimensions(encoder, args):
         print(f"Encoder latent_dim: {encoder_output.shape[-1]}")
     
     # Test phase embedding
-    from utils import get_phase_embedding
+    from volume_utils import get_phase_embedding
     phase_emb = get_phase_embedding(0, dim=32, device='cpu')
     print(f"Phase embedding shape: {phase_emb.shape}")
     
