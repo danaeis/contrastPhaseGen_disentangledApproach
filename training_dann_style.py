@@ -29,7 +29,7 @@ def gradient_reversal(x, lambda_):
     return GradientReversalFunction.apply(x, lambda_)
 
 class DANNTrainerOptimized:
-    """Optimized DANN trainer with frozen encoder and comprehensive logging"""
+    """Optimized DANN trainer and comprehensive logging"""
     
     def __init__(self, device='cuda', use_mixed_precision=True, logger=None):
         self.device = device
@@ -49,14 +49,14 @@ class DANNTrainerOptimized:
             self.quality_metrics = None
     
     def setup_optimizers(self, encoder, generator, discriminator, phase_detector):
-        """Setup optimizers with frozen encoder"""
+        """Setup optimizers"""
         
         # trainable encoder
         for param in encoder.parameters():
             param.requires_grad = True
         encoder.train()
         
-        print("🧊 Encoder frozen for DANN training")
+        print("🧊 DANN training")
         
         # optimize components
         optimizers = {
@@ -89,7 +89,7 @@ class DANNTrainerOptimized:
         return phase_emb.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
     
     def dann_training_step(self, batch, models, optimizers, epoch, max_epochs):
-        """DANN training step with frozen encoder"""
+        """DANN training step """
         
         encoder, generator, discriminator, phase_detector = models
         
@@ -109,7 +109,7 @@ class DANNTrainerOptimized:
             optimizer.zero_grad()
         
         # Compute shared features
-        with autocast(device_type="cuda", enabled=self.use_mixed_precision):
+        with autocast(device="cuda", enabled=self.use_mixed_precision):
             features = encoder(input_vol)
             phase_emb = self._create_phase_embedding(target_phase, dim=32)
             generated = generator(features, phase_emb)
@@ -137,7 +137,7 @@ class DANNTrainerOptimized:
         # Step 2: Train Discriminator
         optimizers['discriminator'].zero_grad()
         
-        with autocast(device_type="cuda", enabled=self.use_mixed_precision):
+        with autocast(device="cuda", enabled=self.use_mixed_precision):
             # Real samples
             real_pred = discriminator(target_vol)
             real_labels = torch.ones_like(real_pred)
@@ -161,7 +161,7 @@ class DANNTrainerOptimized:
         # Step 3: DANN Training for Phase Detector
         optimizers['phase_detector'].zero_grad()
         
-        with autocast(device_type="cuda", enabled=self.use_mixed_precision):
+        with autocast(device="cuda", enabled=self.use_mixed_precision):
             # Phase classification loss (normal)
             phase_pred = phase_detector(features.detach())
             phase_classification_loss = self.ce_loss(phase_pred, input_phase)
@@ -178,7 +178,7 @@ class DANNTrainerOptimized:
         # Step 4: Adversarial update for Encoder (using GRL)
         optimizers['encoder'].zero_grad()
         
-        with autocast(device_type="cuda", enabled=self.use_mixed_precision):
+        with autocast(device="cuda", enabled=self.use_mixed_precision):
             # Apply gradient reversal
             grl_features = gradient_reversal(features, lambda_grl)
             confusion_pred = phase_detector(grl_features)
@@ -332,15 +332,96 @@ class DANNTrainerOptimized:
         
         return results
 
+# Step 2: Copy this function into your file (before your training function)
+def load_phase_checkpoint(checkpoint_dir, models, optimizers=None, device='cuda'):
+    """Load checkpoint from previous phases if they exist"""
+    encoder, generator, discriminator, phase_detector = models
+    
+    # Search patterns in order of priority
+    phase_patterns = [
+        'phase3_completed.pth',
+        'phase2_completed.pth', 
+        'phase1_completed.pth',
+        'dann_final_checkpoint.pth',
+        'dann_best_*.pth',
+        'final_checkpoint.pth',
+        '*_completed.pth'
+    ]
+    
+    checkpoint_path = None
+    print(f"🔍 Searching for phase checkpoints in {checkpoint_dir}...")
+    import glob
+    # Find the first available checkpoint
+    for pattern in phase_patterns:
+        search_pattern = os.path.join(checkpoint_dir, pattern)
+        matching_files = glob.glob(search_pattern)
+        if matching_files:
+            checkpoint_path = max(matching_files, key=os.path.getmtime)
+            print(f"📁 Found checkpoint: {os.path.basename(checkpoint_path)}")
+            break
+    
+    if not checkpoint_path:
+        print("⚠️ No previous phase checkpoints found - starting from scratch")
+        return {'loaded': False, 'epoch': 0, 'phase': 'none', 'metrics': {}}
+    
+    try:
+        print(f"📄 Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # Load model states
+        state_keys = ['encoder_state_dict', 'generator_state_dict', 
+                     'discriminator_state_dict', 'phase_detector_state_dict']
+        
+        for model, state_key in zip(models, state_keys):
+            if state_key in checkpoint:
+                try:
+                    model.load_state_dict(checkpoint[state_key])
+                    print(f"  ✅ Loaded {state_key}")
+                except Exception as e:
+                    print(f"  ⚠️ Failed to load {state_key}: {e}")
+        
+        # Load optimizer states if provided
+        if optimizers and 'optimizers' in checkpoint:
+            opt_checkpoint = checkpoint['optimizers']
+            for name, optimizer in optimizers.items():
+                if name in opt_checkpoint:
+                    try:
+                        optimizer.load_state_dict(opt_checkpoint[name])
+                        print(f"  ✅ Loaded {name} optimizer state")
+                    except Exception as e:
+                        print(f"  ⚠️ Failed to load {name} optimizer: {e}")
+        
+        loaded_epoch = checkpoint.get('epoch', 0)
+        loaded_phase = checkpoint.get('phase', 'unknown')
+        loaded_metrics = checkpoint.get('metrics', {})
+        
+        print(f"✅ Checkpoint loaded successfully!")
+        print(f"   Phase: {loaded_phase} | Epoch: {loaded_epoch}")
+        
+        return {
+            'loaded': True,
+            'epoch': loaded_epoch,
+            'phase': loaded_phase,
+            'metrics': loaded_metrics,
+            'checkpoint_path': checkpoint_path,
+            'encoder_config': checkpoint.get('encoder_config', {})
+        }
+        
+    except Exception as e:
+        print(f"❌ Error loading checkpoint: {e}")
+        return {'loaded': False, 'epoch': 0, 'phase': 'error', 'metrics': {}}
+    
 
 def train_dann_style_contrast_generation(train_loader, encoder, generator, discriminator,
                                         phase_detector, num_epochs=120, device="cuda",
                                         checkpoint_dir="checkpoints", use_mixed_precision=True,
                                         validation_loader=None, encoder_config=None,
                                         encoder_type="simple_cnn", use_sequential_approach=True,
-                                        logger=None):
+                                        logger=None,
+                                        load_previous_phase=True,
+                                        force_restart=False):
     """
-    OPTIMIZED DANN-style training with frozen encoder for Phase 3
+    OPTIMIZED DANN-style training for Phase 3
     """
     
     print(f"\n🚀 Starting OPTIMIZED DANN Training (Phase 3)")
@@ -352,10 +433,27 @@ def train_dann_style_contrast_generation(train_loader, encoder, generator, discr
     # Initialize trainer
     trainer = DANNTrainerOptimized(device, use_mixed_precision, logger)
     
-    # Setup models and optimizers with frozen encoder
+    # Setup models and optimizers
     models = [encoder, generator, discriminator, phase_detector]
-    optimizers = trainer.setup_optimizers_frozen_encoder(*models)
+    optimizers = trainer.setup_optimizers(*models)
+
+    # Load previous phase checkpoint if requested and not forcing restart
+    start_epoch = 0
+    checkpoint_info = {'loaded': False}
     
+    if load_previous_phase and not force_restart:
+        checkpoint_info = load_phase_checkpoint(checkpoint_dir, models, optimizers, device)
+        if checkpoint_info['loaded']:
+            start_epoch = checkpoint_info.get('epoch', 0)
+            print(f"🔄 Resuming training from epoch {start_epoch}")
+            
+            # Adjust epochs if we're continuing
+            if start_epoch > 0:
+                print(f"📊 Adjusting training: {start_epoch} → {start_epoch + num_epochs} epochs")
+    elif force_restart:
+        print("🆕 Force restart enabled - ignoring any existing checkpoints")
+    elif not load_previous_phase:
+        print("⚡ Starting fresh training (load_previous_phase=False)")
     # Setup schedulers
     schedulers = {
         name: optim.lr_scheduler.CosineAnnealingLR(opt, T_max=num_epochs)
@@ -379,8 +477,8 @@ def train_dann_style_contrast_generation(train_loader, encoder, generator, discr
         
         for batch_idx, batch in enumerate(progress_bar):
             try:
-                # DANN training step with frozen encoder
-                step_losses = trainer.dann_training_step_frozen_encoder(
+                # DANN training step
+                step_losses = trainer.dann_training_step(
                     batch, models, optimizers, epoch, num_epochs
                 )
                 
@@ -474,7 +572,7 @@ def train_dann_style_contrast_generation(train_loader, encoder, generator, discr
                 'generator_state_dict': generator.state_dict(),
                 'discriminator_state_dict': discriminator.state_dict(),
                 'phase_detector_state_dict': phase_detector.state_dict(),
-                'training_type': 'dann_frozen_encoder',
+                'training_type': 'dann',
                 'encoder_config': encoder_config
             }, os.path.join(checkpoint_dir, f"dann_checkpoint_epoch_{epoch+1}.pth"))
     
@@ -489,7 +587,7 @@ def train_dann_style_contrast_generation(train_loader, encoder, generator, discr
         'best_reconstruction_loss': best_reconstruction_loss,
         'encoder_config': encoder_config,
         'encoder_type': encoder_type,
-        'training_type': 'dann_frozen_encoder_complete'
+        'training_type': 'dann_complete'
     }, os.path.join(checkpoint_dir, "dann_final_checkpoint.pth"))
     
     print(f"\n✅ DANN training completed!")

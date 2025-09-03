@@ -19,7 +19,16 @@ try:
 except ImportError:
     MONAI_TOTALSEG_AVAILABLE = False
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 PHASE_DIM = 8
+
+def setup_device_training(model_components, device):
+    """Move all model components to specified device"""
+    for component in model_components:
+        component.to(device)
+    
+    return model_components
+
 def create_encoder(args):
     """Unified encoder creation with optimized config handling"""
     encoder_configs = {
@@ -114,7 +123,7 @@ def create_models(args):
 
 def train_models(args, train_loader, val_loader, models, checkpoint_dir, encoder_config):
     """Unified training function"""
-    encoder, generator, discriminator, phase_detector = models
+    encoder, generator, discriminator, phase_detector =  setup_device_training(models, device)
     
     # Select training strategy
     if args.training_strategy == "dann":

@@ -107,8 +107,24 @@ class DinoV3Encoder(nn.Module):
         )
         # Projection layers
         self.slice_projection = nn.Sequential(...)
-        self.slice_aggregator = nn.TransformerEncoder(...)
-        self.final_projection = nn.Sequential(...)
+        # Aggregation across slices - using transformer instead of LSTM
+        self.slice_aggregator = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=latent_dim,
+                nhead=8,
+                dim_feedforward=latent_dim * 2,
+                dropout=0.1,
+                batch_first=True
+            ),
+            num_layers=2
+        )
+
+        # Final projection with residual connection
+        self.final_projection = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.ReLU(),
+            nn.Linear(latent_dim, latent_dim)
+        )
         self.slice_norm = nn.LayerNorm(latent_dim)
         self.final_norm = nn.LayerNorm(latent_dim)
         self.pos_encoding = self._create_positional_encoding(max_slices, latent_dim)

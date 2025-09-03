@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 import os
+import glob
 import time
 import numpy as np
 from tqdm import tqdm
@@ -16,6 +17,243 @@ try:
 except ImportError:
     print("⚠️ Image quality metrics not available - using basic validation")
     HAS_QUALITY_METRICS = False
+
+
+def load_phase_checkpoint(checkpoint_dir, phase_name, models, optimizers=None, device='cuda'):
+    """
+    Load checkpoint from a specific phase if it exists
+    
+    Args:
+        checkpoint_dir: Directory containing checkpoints
+        phase_name: Name of the phase ('phase1', 'phase2', 'phase3')
+        models: List or dict of models to load
+        optimizers: Optional dict of optimizers to restore
+        device: Device to load on
+    
+    Returns:
+        dict: Checkpoint info with loaded status and metrics
+    """
+    
+    # Define checkpoint patterns for this phase
+    phase_patterns = [
+        f'{phase_name}_complete.pth',
+        f'{phase_name}_complete.pth', 
+        f'{phase_name}_best.pth',
+        f'{phase_name}_final.pth'
+    ]
+    
+    checkpoint_path = None
+    print(f"🔍 Searching for {phase_name} checkpoints in {checkpoint_dir}...")
+    
+    # Find the first available checkpoint for this phase
+    for pattern in phase_patterns:
+        # search_pattern = os.path.join(checkpoint_dir, pattern)
+        # matching_files = glob.glob(search_pattern)
+        # print('matchong file', search_pattern,matching_files)
+        manual_path = os.path.join(checkpoint_dir, pattern)
+        print("manual path", manual_path)
+        if os.path.isfile(manual_path):
+            checkpoint_path = manual_path
+            print(f"📁 Found {phase_name} checkpoint via manual check: {checkpoint_path}")
+            break
+    
+    if not checkpoint_path:
+        print(f"⚠️ No {phase_name} checkpoint found - will run this phase")
+        return {'loaded': False, 'skip_phase': False, 'metrics': {}}
+    
+    try:
+        print(f"📄 Loading {phase_name} checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # Handle both list and dict of models
+        if isinstance(models, list):
+            model_names = ['encoder', 'generator', 'discriminator', 'phase_detector']
+            model_dict = {name: model for name, model in zip(model_names, models)}
+        else:
+            model_dict = models
+        
+        # Load model states
+        state_keys = {
+            'encoder': 'encoder_state_dict',
+            'generator': 'generator_state_dict', 
+            'discriminator': 'discriminator_state_dict',
+            'phase_detector': 'phase_detector_state_dict'
+        }
+        
+        loaded_models = []
+        for model_name, model in model_dict.items():
+            state_key = state_keys.get(model_name)
+            if state_key and state_key in checkpoint:
+                try:
+                    model.load_state_dict(checkpoint[state_key])
+                    loaded_models.append(model_name)
+                    print(f"  ✅ Loaded {model_name} from {phase_name}")
+                except Exception as e:
+                    print(f"  ⚠️ Failed to load {model_name}: {e}")
+        
+        # Load optimizer states if provided
+        if optimizers and 'optimizers' in checkpoint:
+            opt_checkpoint = checkpoint['optimizers']
+            for name, optimizer in optimizers.items():
+                if name in opt_checkpoint:
+                    try:
+                        optimizer.load_state_dict(opt_checkpoint[name])
+                        print(f"  ✅ Loaded {name} optimizer from {phase_name}")
+                    except Exception as e:
+                        print(f"  ⚠️ Failed to load {name} optimizer: {e}")
+        
+        loaded_metrics = {
+            'phase_accuracy': checkpoint.get('phase_accuracy', 0),
+            'reconstruction_loss': checkpoint.get('reconstruction_loss', float('inf')),
+            'confusion_accuracy': checkpoint.get('confusion_accuracy', 0)
+        }
+        
+        print(f"✅ {phase_name} checkpoint loaded successfully!")
+        print(f"   Models loaded: {loaded_models}")
+        if loaded_metrics['phase_accuracy'] > 0:
+            print(f"   Phase accuracy: {loaded_metrics['phase_accuracy']:.4f}")
+        if loaded_metrics['reconstruction_loss'] < float('inf'):
+            print(f"   Reconstruction loss: {loaded_metrics['reconstruction_loss']:.6f}")
+        
+        return {
+            'loaded': True,
+            'skip_phase': True,  # Skip this phase since it's already completed
+            'metrics': loaded_metrics,
+            'checkpoint_path': checkpoint_path,
+            'loaded_models': loaded_models
+        }
+        
+    except Exception as e:
+        print(f"❌ Error loading {phase_name} checkpoint: {e}")
+        return {'loaded': False, 'skip_phase': False, 'metrics': {}, 'error': str(e)}
+
+
+def check_training_progress(checkpoint_dir):
+    """
+    Check which phases have been completed and return training status
+    
+    Returns:
+        dict: Status of each phase and recommended starting point
+    """
+    phases = ['phase1', 'phase2', 'phase3']
+    status = {}
+    
+    print(f"🔍 Checking training progress in {checkpoint_dir}...")
+    
+    for phase in phases:
+        patterns = [f'{phase}_completed.pth', f'{phase}_complete.pth']
+        phase_completed = False
+        
+        for pattern in patterns:
+            if glob.glob(os.path.join(checkpoint_dir, pattern)):
+                phase_completed = True
+                break
+        
+        status[phase] = phase_completed
+        print(f"  {phase}: {'✅ Completed' if phase_completed else '❌ Not completed'}")
+    
+    # Determine starting phase
+    if status['phase3']:
+        start_phase = 'completed'
+        print("🎉 All phases completed!")
+    elif status['phase2']:
+        start_phase = 'phase3'
+        print("🚀 Will start from Phase 3 (DANN training)")
+    elif status['phase1']:
+        start_phase = 'phase2'
+        print("🚀 Will start from Phase 2 (Encoder + Generator)")
+    else:
+        start_phase = 'phase1'
+        print("🚀 Will start from Phase 1 (Phase Detector)")
+    
+    return {
+        'phase_status': status,
+        'start_phase': start_phase,
+        'completed_phases': sum(status.values())
+    }
+
+
+class OptimizedLogger:
+    """Simple but comprehensive logger"""
+    
+    def __init__(self, checkpoint_dir, experiment_name):
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.log_dir = self.checkpoint_dir / "logs"
+        self.log_dir.mkdir(exist_ok=True, parents=True)
+        
+        self.csv_file = self.log_dir / f"{experiment_name}_metrics.csv"
+        self.log_file = self.log_dir / f"{experiment_name}_training.log"
+        
+        # Initialize CSV with comprehensive headers
+        headers = [
+            'epoch', 'phase', 'reconstruction_loss', 'generator_loss', 'discriminator_loss',
+            'phase_classification_loss', 'phase_accuracy', 'confusion_accuracy', 'lambda_grl',
+            'psnr', 'ssim', 'ms_ssim', 'clinical_status', 'training_time', 'memory_mb'
+        ]
+        
+        with open(self.csv_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+        
+        print(f"📊 Logger initialized - saving to {self.log_dir}")
+    
+    def log_epoch(self, epoch, phase, losses, quality_metrics=None, epoch_time=0):
+        """Log epoch with all metrics"""
+        
+        # Get memory usage
+        memory_mb = torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else 0
+        
+        # Clinical assessment
+        clinical_status = "unknown"
+        if quality_metrics:
+            psnr = quality_metrics.get('psnr', 0)
+            ssim = quality_metrics.get('ssim', 0)
+            if psnr >= 30 and ssim >= 0.8:
+                clinical_status = "excellent"
+            elif psnr >= 25 and ssim >= 0.7:
+                clinical_status = "good"
+            elif psnr >= 20 and ssim >= 0.6:
+                clinical_status = "acceptable"
+            else:
+                clinical_status = "poor"
+        
+        # Prepare row
+        row = [
+            epoch, phase,
+            losses.get('reconstruction', 0),
+            losses.get('generator', 0), 
+            losses.get('discriminator', 0),
+            losses.get('phase', 0),
+            losses.get('phase_acc', 0),
+            losses.get('confusion_acc', 0),
+            losses.get('lambda_grl', 0),
+            quality_metrics.get('psnr', 0) if quality_metrics else 0,
+            quality_metrics.get('ssim', 0) if quality_metrics else 0,
+            quality_metrics.get('ms_ssim', 0) if quality_metrics else 0,
+            clinical_status,
+            epoch_time,
+            memory_mb
+        ]
+        
+        # Write to CSV
+        with open(self.csv_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+        
+        # Write to log file
+        log_msg = f"Epoch {epoch+1} ({phase}): "
+        log_msg += f"Recon={losses.get('reconstruction', 0):.4f}, "
+        if quality_metrics:
+            log_msg += f"PSNR={quality_metrics.get('psnr', 0):.1f}dB, "
+            log_msg += f"SSIM={quality_metrics.get('ssim', 0):.3f}, "
+        log_msg += f"Clinical={clinical_status}, "
+        log_msg += f"Time={epoch_time:.2f}s, Mem={memory_mb:.0f}MB\n"
+        
+        with open(self.log_file, 'a') as f:
+            f.write(log_msg)
+        
+        # Print to console
+        print(log_msg.strip())
 
 
 class OptimizedLogger:
@@ -185,11 +423,18 @@ def validate_with_quality_metrics(val_loader, encoder, generator, phase_detector
 
 
 def train_phase_detector_only(train_loader, encoder, phase_detector, num_epochs=30, 
-                            device="cuda", logger=None):
+                            device="cuda", logger=None, checkpoint_dir="checkpoints"):
     """Phase 1: Pretrain phase detector with frozen encoder"""
     print(f"\n{'='*60}")
     print("PHASE 1: PRETRAINING PHASE DETECTOR ONLY")
     print(f"{'='*60}")
+    # Check if this phase is already completed
+    models = {'encoder': encoder, 'phase_detector': phase_detector}
+    checkpoint_info = load_phase_checkpoint(checkpoint_dir, 'phase1', models, device=device)
+    
+    if checkpoint_info['skip_phase']:
+        print("✅ Phase 1 already completed - skipping")
+        return checkpoint_info['metrics'].get('phase_accuracy', 0.85)
     
     # Freeze encoder
     for param in encoder.parameters():
@@ -270,11 +515,23 @@ def train_phase_detector_only(train_loader, encoder, phase_detector, num_epochs=
 
 
 def train_encoder_generator(train_loader, encoder, generator, discriminator, phase_detector, 
-                          num_epochs=75, device="cuda", logger=None, validation_loader=None):
+                          num_epochs=75, device="cuda", logger=None, validation_loader=None, checkpoint_dir='checkpoints'):
     """Phase 2: Train encoder + generator with frozen phase detector"""
     print(f"\n{'='*60}")
     print("PHASE 2: TRAINING ENCODER + GENERATOR")
     print(f"{'='*60}")
+    # Check if this phase is already completed
+    models = [encoder, generator, discriminator, phase_detector]
+    checkpoint_info = load_phase_checkpoint(checkpoint_dir, 'phase2', models, device=device)
+    
+    if checkpoint_info['skip_phase']:
+        print("✅ Phase 2 already completed - skipping")
+        return checkpoint_info['metrics'].get('reconstruction_loss', 0.1)
+    # If phase 1 is completed, load it first
+    if not checkpoint_info['loaded']:
+        phase1_info = load_phase_checkpoint(checkpoint_dir, 'phase1', models, device=device)
+        if phase1_info['loaded']:
+            print("📄 Loaded Phase 1 results as prerequisite")
     
     # Freeze phase detector
     for param in phase_detector.parameters():
@@ -411,12 +668,13 @@ def train_encoder_generator(train_loader, encoder, generator, discriminator, pha
     print(f"✅ Phase 2 completed! Best loss: {best_recon_loss:.6f}")
     return best_recon_loss
 
-
 def train_contrast_phase_generation_optimized(train_loader, encoder, generator, discriminator, 
                                             phase_detector, num_epochs=225, device="cuda",
                                             checkpoint_dir="checkpoints", use_mixed_precision=True,
                                             validation_loader=None, encoder_config=None, 
-                                            encoder_type="simple_cnn"):
+                                            encoder_type="simple_cnn",
+                                            load_previous_phase=True,
+                                            force_restart=False):
     """
     OPTIMIZED Sequential training:
     Phase 1: Pretrain phase detector (30 epochs)
@@ -434,11 +692,11 @@ def train_contrast_phase_generation_optimized(train_loader, encoder, generator, 
     logger = OptimizedLogger(checkpoint_dir, f"sequential_training")
     
     total_start_time = time.time()
-
+    
     # Phase 1: Pretrain Phase Detector (1/5 num epochs)
     phase_1_epochs = num_epochs//5
     best_phase_acc = train_phase_detector_only(
-        train_loader, encoder, phase_detector, phase_1_epochs, device, logger
+        train_loader, encoder, phase_detector, phase_1_epochs, device, logger, checkpoint_dir
     )
     
     # Save Phase 1 checkpoint
@@ -470,7 +728,7 @@ def train_contrast_phase_generation_optimized(train_loader, encoder, generator, 
     
     # Phase 3: DANN Training (120 epochs) - Use existing optimized DANN
     print(f"\n{'='*60}")
-    print("PHASE 3: DANN TRAINING WITH FROZEN ENCODER")
+    print("PHASE 3: DANN TRAINING")
     print(f"{'='*60}")
     
     # Import and use your optimized DANN training

@@ -1,0 +1,77 @@
+{
+  "experiment_info": {
+    "timestamp": "2025-09-02T18:03:31.143869",
+    "data_path": "../ncct_cect/vindr_ds/original_volumes/Abdomen/raw_image/",
+    "batch_size": 4,
+    "spatial_size": [
+      128,
+      128,
+      128
+    ],
+    "device": "cuda",
+    "max_samples_debug": null
+  },
+  "results": {
+    "MedViT": {
+      "training": {
+        "train_accuracy": 1.0,
+        "val_accuracy": 0.9238095238095239,
+        "cv_mean": 0.732836587872559,
+        "cv_std": 0.05236230192100939,
+        "train_samples": 419,
+        "n_features": 256,
+        "n_components": 2,
+        "total_variance_explained": 1.0
+      },
+      "testing": {
+        "accuracy": 0.9847328244274809,
+        "test_samples": 524,
+        "roc_auc": 0.9898185604973472
+      },
+      "config": {
+        "type": "medvit",
+        "params": {
+          "model_size": "small",
+          "pretrained_path": "pretrained_medvit_small.pth",
+          "latent_dim": 256,
+          "aggregation_method": "lstm",
+          "slice_sampling": "uniform",
+          "max_slices": 32
+        },
+        "lda_params": {
+          "n_components": 2
+        }
+      }
+    },
+    "TimmViT": {
+      "training": {
+        "train_accuracy": 0.863961813842482,
+        "val_accuracy": 0.3333333333333333,
+        "cv_mean": 0.3629667694415895,
+        "cv_std": 0.06837641102204603,
+        "train_samples": 419,
+        "n_features": 256,
+        "n_components": 2,
+        "total_variance_explained": 1.0
+      },
+      "testing": {
+        "accuracy": 0.7576335877862596,
+        "test_samples": 524,
+        "roc_auc": 0.857914959152979
+      },
+      "config": {
+        "type": "timm_vit",
+        "params": {
+          "latent_dim": 256,
+          "model_name": "vit_small_patch16_224",
+          "pretrained": false,
+          "max_slices": 32,
+          "slice_sampling": "uniform"
+        },
+        "lda_params": {
+          "n_components": 2
+        }
+      }
+    }
+  }
+}
