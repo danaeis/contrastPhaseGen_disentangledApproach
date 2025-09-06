@@ -31,7 +31,7 @@ def gradient_reversal(x, lambda_):
 class DANNTrainerOptimized:
     """Optimized DANN trainer and comprehensive logging"""
     
-    def __init__(self, device='cuda', use_mixed_precision=True, logger=None):
+    def __init__(self, device='cuda', use_mixed_precision=True, logger=None, phase_dim=8):
         self.device = device
         self.use_mixed_precision = use_mixed_precision
         self.scaler = GradScaler() if use_mixed_precision else None
@@ -41,6 +41,7 @@ class DANNTrainerOptimized:
         self.l1_loss = nn.L1Loss()
         self.ce_loss = nn.CrossEntropyLoss()
         self.bce_loss = nn.BCEWithLogitsLoss()
+        self.phase_dim = phase_dim
         
         # Quality metrics
         if HAS_QUALITY_METRICS:
@@ -86,7 +87,8 @@ class DANNTrainerOptimized:
             if mask.any():
                 phase_emb[mask, i*dim//3:(i+1)*dim//3] = 1.0
         
-        return phase_emb.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        # Return as 2D tensor to match Generator input expectations (batch, dim)
+        return phase_emb
     
     def dann_training_step(self, batch, models, optimizers, epoch, max_epochs):
         """DANN training step """
@@ -109,9 +111,9 @@ class DANNTrainerOptimized:
             optimizer.zero_grad()
         
         # Compute shared features
-        with autocast(device="cuda", enabled=self.use_mixed_precision):
+        with autocast(enabled=self.use_mixed_precision):
             features = encoder(input_vol)
-            phase_emb = self._create_phase_embedding(target_phase, dim=32)
+            phase_emb = self._create_phase_embedding(target_phase, dim=self.phase_dim)
             generated = generator(features, phase_emb)
             
             # Reconstruction loss
@@ -137,7 +139,7 @@ class DANNTrainerOptimized:
         # Step 2: Train Discriminator
         optimizers['discriminator'].zero_grad()
         
-        with autocast(device="cuda", enabled=self.use_mixed_precision):
+        with autocast(enabled=self.use_mixed_precision):
             # Real samples
             real_pred = discriminator(target_vol)
             real_labels = torch.ones_like(real_pred)
@@ -161,7 +163,7 @@ class DANNTrainerOptimized:
         # Step 3: DANN Training for Phase Detector
         optimizers['phase_detector'].zero_grad()
         
-        with autocast(device="cuda", enabled=self.use_mixed_precision):
+        with autocast(enabled=self.use_mixed_precision):
             # Phase classification loss (normal)
             phase_pred = phase_detector(features.detach())
             phase_classification_loss = self.ce_loss(phase_pred, input_phase)
@@ -178,7 +180,9 @@ class DANNTrainerOptimized:
         # Step 4: Adversarial update for Encoder (using GRL)
         optimizers['encoder'].zero_grad()
         
-        with autocast(device="cuda", enabled=self.use_mixed_precision):
+        with autocast(enabled=self.use_mixed_precision):
+            # Recompute features to build a fresh graph for encoder adversarial update
+            features = encoder(input_vol)
             # Apply gradient reversal
             grl_features = gradient_reversal(features, lambda_grl)
             confusion_pred = phase_detector(grl_features)
@@ -192,7 +196,7 @@ class DANNTrainerOptimized:
         else:
             confusion_loss.backward()
             optimizers['encoder'].step()
-
+        
         # Calculate accuracies
         with torch.no_grad():
             _, phase_pred_labels = torch.max(phase_pred, 1)
@@ -410,16 +414,17 @@ def load_phase_checkpoint(checkpoint_dir, models, optimizers=None, device='cuda'
     except Exception as e:
         print(f"❌ Error loading checkpoint: {e}")
         return {'loaded': False, 'epoch': 0, 'phase': 'error', 'metrics': {}}
-    
+
 
 def train_dann_style_contrast_generation(train_loader, encoder, generator, discriminator,
                                         phase_detector, num_epochs=120, device="cuda",
-                                        checkpoint_dir="checkpoints", use_mixed_precision=True,
-                                        validation_loader=None, encoder_config=None,
+                                             checkpoint_dir="checkpoints", use_mixed_precision=True,
+                                             validation_loader=None, encoder_config=None,
                                         encoder_type="simple_cnn", use_sequential_approach=True,
                                         logger=None,
                                         load_previous_phase=True,
-                                        force_restart=False):
+                                        force_restart=False,
+                                        phase_dim=8):
     """
     OPTIMIZED DANN-style training for Phase 3
     """
@@ -431,7 +436,7 @@ def train_dann_style_contrast_generation(train_loader, encoder, generator, discr
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     # Initialize trainer
-    trainer = DANNTrainerOptimized(device, use_mixed_precision, logger)
+    trainer = DANNTrainerOptimized(device, use_mixed_precision, logger, phase_dim=phase_dim)
     
     # Setup models and optimizers
     models = [encoder, generator, discriminator, phase_detector]
@@ -490,7 +495,7 @@ def train_dann_style_contrast_generation(train_loader, encoder, generator, discr
                     'conf_acc': f"{step_losses['confusion_acc']:.3f}",
                     'λ': f"{step_losses['lambda_grl']:.3f}"
                 })
-                
+                    
             except RuntimeError as e:
                 if "Trying to backward through the graph a second time" in str(e):
                     print(f"⚠️ Graph error at batch {batch_idx} - continuing")
@@ -555,10 +560,10 @@ def train_dann_style_contrast_generation(train_loader, encoder, generator, discr
                 if avg_losses['confusion_acc'] > 0.4:
                     print("  ✅ DANN: Encoder learning phase-invariant features!")
             
-            # Early stopping for DANN success
-            if avg_losses['confusion_acc'] > 0.5:
-                print(f"🎉 DANN early success! Achieved {avg_losses['confusion_acc']:.3f} confusion accuracy")
-                break
+            # # Early stopping for DANN success
+            # if avg_losses['confusion_acc'] > 0.5:
+            #     print(f"🎉 DANN early success! Achieved {avg_losses['confusion_acc']:.3f} confusion accuracy")
+            #     break
         
         # Update schedulers
         for scheduler in schedulers.values():

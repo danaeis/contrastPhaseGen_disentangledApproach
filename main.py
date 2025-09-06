@@ -132,7 +132,7 @@ def train_models(args, train_loader, val_loader, models, checkpoint_dir, encoder
             train_loader, encoder, generator, discriminator, phase_detector,
             num_epochs=args.epochs, device=args.device, checkpoint_dir=checkpoint_dir,
             use_mixed_precision=args.mixed_precision, validation_loader=val_loader,
-            encoder_config=encoder_config, encoder_type=args.encoder
+            encoder_config=encoder_config, encoder_type=args.encoder, phase_dim = PHASE_DIM
         )
     else:
         print("🎯 Using sequential training")

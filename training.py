@@ -63,7 +63,7 @@ def load_phase_checkpoint(checkpoint_dir, phase_name, models, optimizers=None, d
     
     try:
         print(f"📄 Loading {phase_name} checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         
         # Handle both list and dict of models
         if isinstance(models, list):
