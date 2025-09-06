@@ -1,0 +1,57 @@
+{
+  "accuracy": 0.7519083969465649,
+  "test_samples": 524,
+  "classification_report": {
+    "Non-contrast": {
+      "precision": 0.7401129943502824,
+      "recall": 0.7485714285714286,
+      "f1-score": 0.7443181818181818,
+      "support": 175.0
+    },
+    "Arterial": {
+      "precision": 0.7777777777777778,
+      "recall": 0.7241379310344828,
+      "f1-score": 0.75,
+      "support": 174.0
+    },
+    "Venous": {
+      "precision": 0.7405405405405405,
+      "recall": 0.7828571428571428,
+      "f1-score": 0.7611111111111111,
+      "support": 175.0
+    },
+    "accuracy": 0.7519083969465649,
+    "macro avg": {
+      "precision": 0.7528104375562003,
+      "recall": 0.751855500821018,
+      "f1-score": 0.7518097643097642,
+      "support": 524.0
+    },
+    "weighted avg": {
+      "precision": 0.7527627899603576,
+      "recall": 0.7519083969465649,
+      "f1-score": 0.7518132180584469,
+      "support": 524.0
+    }
+  },
+  "confusion_matrix": [
+    [
+      131,
+      19,
+      25
+    ],
+    [
+      25,
+      126,
+      23
+    ],
+    [
+      21,
+      17,
+      137
+    ]
+  ],
+  "timestamp": "2025-09-03T17:39:48.775956",
+  "model_path": "contrast_phase_results/TimmViT/TimmViT_trained_model.pkl",
+  "roc_auc": 0.8694830330775396
+}

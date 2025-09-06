@@ -1,0 +1,36 @@
+CONTRAST PHASE CLASSIFICATION EXPERIMENT SUMMARY
+============================================================
+
+Experiment Date: 2025-09-03T17:39:22.391077
+Data Path: ../ncct_cect/vindr_ds/original_volumes/Abdomen/raw_image/
+Device: cuda
+
+RESULTS SUMMARY:
+------------------------------
+Best Performing Encoder: Dino_v3
+Best Test Accuracy: 0.9733
+
+
+Dino_v3:
+  Training Accuracy: 1.0000
+  Test Accuracy: 0.9733
+  CV Score: 0.6874 ± 0.0642
+  Variance Explained: 1.0000
+  Feature Dimensions: 256
+  LDA Components: 2
+
+MedViT:
+  Training Accuracy: 0.9928
+  Test Accuracy: 0.9618
+  CV Score: 0.6850 ± 0.0050
+  Variance Explained: 1.0000
+  Feature Dimensions: 256
+  LDA Components: 2
+
+TimmViT:
+  Training Accuracy: 0.8425
+  Test Accuracy: 0.7519
+  CV Score: 0.3245 ± 0.0284
+  Variance Explained: 1.0000
+  Feature Dimensions: 256
+  LDA Components: 2

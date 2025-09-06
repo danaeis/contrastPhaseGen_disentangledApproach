@@ -1,0 +1,107 @@
+{
+  "experiment_info": {
+    "timestamp": "2025-09-03T17:39:22.391077",
+    "data_path": "../ncct_cect/vindr_ds/original_volumes/Abdomen/raw_image/",
+    "batch_size": 4,
+    "spatial_size": [
+      128,
+      128,
+      128
+    ],
+    "device": "cuda",
+    "max_samples_debug": null
+  },
+  "results": {
+    "Dino_v3": {
+      "training": {
+        "train_accuracy": 1.0,
+        "val_accuracy": 0.8666666666666667,
+        "cv_mean": 0.6873586844809867,
+        "cv_std": 0.06419543872512483,
+        "train_samples": 419,
+        "n_features": 256,
+        "n_components": 2,
+        "total_variance_explained": 1.0
+      },
+      "testing": {
+        "accuracy": 0.9732824427480916,
+        "test_samples": 524,
+        "roc_auc": 0.9755614210905191
+      },
+      "config": {
+        "type": "dinov3",
+        "params": {
+          "latent_dim": 256,
+          "model_size": "small",
+          "pretrained": true,
+          "max_slices": 32,
+          "slice_sampling": "uniform"
+        },
+        "lda_params": {
+          "n_components": 2
+        }
+      }
+    },
+    "MedViT": {
+      "training": {
+        "train_accuracy": 0.9928400954653938,
+        "val_accuracy": 0.8380952380952381,
+        "cv_mean": 0.6849777321000343,
+        "cv_std": 0.004957462395843677,
+        "train_samples": 419,
+        "n_features": 256,
+        "n_components": 2,
+        "total_variance_explained": 1.0
+      },
+      "testing": {
+        "accuracy": 0.9618320610687023,
+        "test_samples": 524,
+        "roc_auc": 0.9691130966103794
+      },
+      "config": {
+        "type": "medvit",
+        "params": {
+          "model_size": "small",
+          "pretrained_path": "pretrained_medvit_small.pth",
+          "latent_dim": 256,
+          "aggregation_method": "lstm",
+          "slice_sampling": "uniform",
+          "max_slices": 32
+        },
+        "lda_params": {
+          "n_components": 2
+        }
+      }
+    },
+    "TimmViT": {
+      "training": {
+        "train_accuracy": 0.8424821002386634,
+        "val_accuracy": 0.3904761904761905,
+        "cv_mean": 0.3245460774237752,
+        "cv_std": 0.028358378557396202,
+        "train_samples": 419,
+        "n_features": 256,
+        "n_components": 2,
+        "total_variance_explained": 1.0
+      },
+      "testing": {
+        "accuracy": 0.7519083969465649,
+        "test_samples": 524,
+        "roc_auc": 0.8694830330775396
+      },
+      "config": {
+        "type": "timm_vit",
+        "params": {
+          "latent_dim": 256,
+          "model_name": "vit_small_patch16_224",
+          "pretrained": false,
+          "max_slices": 32,
+          "slice_sampling": "uniform"
+        },
+        "lda_params": {
+          "n_components": 2
+        }
+      }
+    }
+  }
+}
