@@ -149,14 +149,24 @@ def extract_features_from_encoder_optimized(encoder, data_loader, device='cuda',
     
     return features, all_phases, all_scan_ids
 
-def create_phase_mapping():
-    """Create mapping from phase numbers to phase names"""
-    return {
-        0: 'Non-contrast',
+def create_phase_mapping(unique_classes):
+    """Create phase mapping based on actual classes in data"""
+    
+    # Default phase names
+    default_phases = {
+        0: 'Non-contrast', 
         1: 'Arterial', 
-        2: 'Venous',
-        3: 'Delayed'
+        2: 'Venous', 
+        3: 'Delayed', 
+        4: 'Hepatobiliary'
     }
+    
+    # Create mapping only for classes that exist
+    phase_mapping = {}
+    for class_idx in unique_classes:
+        phase_mapping[class_idx] = default_phases.get(class_idx, f'Phase_{class_idx}')
+    
+    return phase_mapping
 
 def explain_silhouette_score():
     """

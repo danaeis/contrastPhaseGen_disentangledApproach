@@ -63,15 +63,26 @@ except ImportError as e:
     prepare_data = None
     DATA_FUNCTIONS_AVAILABLE = False
 
-try:
-    from feature_visualization import create_phase_mapping
-    FEATURE_VIZ_AVAILABLE = True
-except ImportError as e:
-    print(f"Warning: feature_visualization functions not available: {e}")
-    # Fallback phase mapping
-    def create_phase_mapping():
-        return {0: 'Non-contrast', 1: 'Arterial', 2: 'Venous', 3: 'Delayed', 4: 'Hepatobiliary'}
-    FEATURE_VIZ_AVAILABLE = False
+from feature_visualization import create_phase_mapping
+# def create_phase_mapping(unique_classes):
+#     """Create phase mapping based on actual classes in data"""
+    
+#     # Default phase names
+#     default_phases = {
+#         0: 'Non-contrast', 
+#         1: 'Arterial', 
+#         2: 'Venous', 
+#         3: 'Delayed', 
+#         4: 'Hepatobiliary'
+#     }
+    
+#     # Create mapping only for classes that exist
+#     phase_mapping = {}
+#     for class_idx in unique_classes:
+#         phase_mapping[class_idx] = default_phases.get(class_idx, f'Phase_{class_idx}')
+    
+#     return phase_mapping
+
 
 
 class AttentionMLP(nn.Module):
@@ -79,7 +90,7 @@ class AttentionMLP(nn.Module):
     MLP with attention mechanism for contrast phase classification
     """
     def __init__(self, input_dim, hidden_dims=[512, 256, 128], n_classes=5, 
-                 dropout_rate=0.3, use_attention=True, attention_heads=8):
+                 dropout_rate=0.3, use_attention=False, attention_heads=8):
         super(AttentionMLP, self).__init__()
         
         self.input_dim = input_dim
@@ -170,7 +181,7 @@ class ContrastPhaseMLPClassifier(nn.Module):
     End-to-end trainable contrast phase classifier with MLP head
     """
     def __init__(self, encoder, encoder_name, mlp_config=None, n_classes=5, 
-                 freeze_encoder=False, enable_gradcam=True):
+                 freeze_encoder='full', enable_gradcam=True):
         super(ContrastPhaseMLPClassifier, self).__init__()
         
         self.encoder = encoder
@@ -180,9 +191,18 @@ class ContrastPhaseMLPClassifier(nn.Module):
         self.enable_gradcam = enable_gradcam
         
         # Freeze encoder if requested
-        if freeze_encoder:
+        if freeze_encoder == 'full':
+            # Freeze all encoder parameters
             for param in self.encoder.parameters():
                 param.requires_grad = False
+                
+        elif freeze_encoder == 'partial':
+            # Freeze early layers, unfreeze final layers
+            self._selective_freeze()
+            
+        elif freeze_encoder == 'none':
+            # Keep all parameters trainable
+            pass
         
         # Get encoder output dimension
         self.encoder_dim = self._get_encoder_dim()
@@ -192,7 +212,7 @@ class ContrastPhaseMLPClassifier(nn.Module):
             mlp_config = {
                 'hidden_dims': [512, 256, 128],
                 'dropout_rate': 0.3,
-                'use_attention': True,
+                'use_attention': False,
                 'attention_heads': 8
             }
         
@@ -211,8 +231,21 @@ class ContrastPhaseMLPClassifier(nn.Module):
             self._register_hooks()
         
         # Phase mapping
-        self.phase_mapping = create_phase_mapping()
+        self.phase_mapping = None
     
+    def _selective_freeze(self):
+        """Freeze early layers, keep final layers trainable for better saliency"""
+        # For Vision Transformers, keep last few transformer blocks trainable
+        if hasattr(self.encoder, 'dino'):
+            # Freeze early blocks, unfreeze last 2-3 blocks
+            for name, param in self.encoder.named_parameters():
+                if 'slice_projection' in name or 'final_projection' in name:
+                    param.requires_grad = True
+                elif any(x in name for x in ['11', '10', '9']):  # Last few blocks
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
+                    
     def _get_encoder_dim(self):
         """Get the output dimension of the encoder"""
         # Create a dummy input to determine encoder output size
@@ -435,8 +468,8 @@ class ContrastPhaseMLPClassifier(nn.Module):
                 plt.axis('off')
         
         # Add prediction information
-        phase_name = self.phase_mapping.get(pred_class, f'Phase_{pred_class}')
-        plt.suptitle(f'3D Saliency Map - Predicted: {phase_name} (Confidence: {class_prob:.3f})', 
+        # phase_name = self.phase_mapping.get(pred_class, f'Phase_{pred_class}')
+        plt.suptitle(f'3D Saliency Map - Predicted: {pred_class} (Confidence: {class_prob:.3f})', 
                     fontsize=16)
         
         plt.tight_layout()
@@ -451,7 +484,7 @@ class ContrastPhaseMLPClassifier(nn.Module):
             'saliency_map': saliency_map,
             'predicted_class': pred_class,
             'class_probability': class_prob,
-            'phase_name': phase_name,
+            'phase_name': pred_class,
             'original_volume': original_volume
         }
 
@@ -460,7 +493,7 @@ class ContrastPhaseTrainer:
     """
     Trainer class for end-to-end training of contrast phase classification
     """
-    def __init__(self, model, device='cuda', learning_rate=1e-4, weight_decay=1e-4):
+    def __init__(self, model, device='cuda', learning_rate=1e-4, weight_decay=1e-4, phase_mapping=None):
         self.model = model.to(device)
         self.device = device
         
@@ -484,15 +517,17 @@ class ContrastPhaseTrainer:
             'val_loss': [], 'val_acc': [],
             'learning_rates': []
         }
+        self.phase_mapping = phase_mapping or {}
         
-        # Phase mapping
-        self.phase_mapping = create_phase_mapping()
     
     def compute_class_weights(self, train_labels):
         """Compute class weights for imbalanced dataset"""
         unique_classes, class_counts = np.unique(train_labels, return_counts=True)
         total_samples = len(train_labels)
         
+        # Phase mapping
+        self.phase_mapping = create_phase_mapping(unique_classes)
+
         # Inverse frequency weighting
         class_weights = total_samples / (len(unique_classes) * class_counts)
         
@@ -515,8 +550,8 @@ class ContrastPhaseTrainer:
         for batch_idx, batch_data in enumerate(progress_bar):
             # Get data
             if isinstance(batch_data, dict):
-                images = batch_data['image'].to(self.device)
-                labels = batch_data['label'].to(self.device)
+                images = batch_data['input_path'].to(self.device)
+                labels = batch_data['input_phase'].to(self.device)
             else:
                 images, labels = batch_data
                 images = images.to(self.device)
@@ -573,8 +608,8 @@ class ContrastPhaseTrainer:
             for batch_data in tqdm(val_loader, desc="Validation"):
                 # Get data
                 if isinstance(batch_data, dict):
-                    images = batch_data['image'].to(self.device)
-                    labels = batch_data['label'].to(self.device)
+                    images = batch_data['input_path'].to(self.device)
+                    labels = batch_data['input_phase'].to(self.device)
                 else:
                     images, labels = batch_data
                     images = images.to(self.device)
@@ -609,31 +644,82 @@ class ContrastPhaseTrainer:
     
     def _compute_detailed_metrics(self, predictions, labels):
         """Compute detailed classification metrics"""
+        # Convert numpy types to standard Python types
+        if hasattr(predictions, 'cpu'):
+            predictions = [int(x) for x in predictions.cpu().numpy()]
+        elif isinstance(predictions, np.ndarray):
+            predictions = [int(x) for x in predictions]
+        else:
+            predictions = [int(x) for x in predictions]
+            
+        if hasattr(labels, 'cpu'):
+            labels = [int(x) for x in labels.cpu().numpy()]  
+        elif isinstance(labels, np.ndarray):
+            labels = [int(x) for x in labels]
+        else:
+            labels = [int(x) for x in labels]
+        # Get unique classes as standard Python integers
+        unique_classes = sorted(list(set(labels + predictions)))
+        n_actual_classes = len(unique_classes)
+        
+        print(f"Detected {n_actual_classes} classes: {unique_classes}")
+        print(f"Class types: {[type(x).__name__ for x in unique_classes]}")
+        # Create phase names only for classes that actually exist
+        if self.phase_mapping is None or not self.phase_mapping:
+            print("Creating phase mapping from detected classes...")
+            self.phase_mapping = create_phase_mapping([int(x) for x in unique_classes])
+
+        phase_names = []
+        for class_idx in unique_classes:
+            phase_name = self.phase_mapping.get(class_idx, f'Phase_{class_idx}')
+            phase_names.append(phase_name)
+        
+        print(f"Detected {n_actual_classes} classes: {unique_classes}")
+        print(f"Phase names: {phase_names}")
         # Classification report
-        phase_names = [self.phase_mapping.get(i, f'Phase_{i}') for i in range(self.model.n_classes)]
-        report = classification_report(
-            labels, predictions, 
-            target_names=phase_names,
-            output_dict=True,
-            zero_division=0
-        )
-        
-        # Confusion matrix
-        cm = confusion_matrix(labels, predictions)
-        
-        # Per-class metrics
-        precision, recall, f1, support = precision_recall_fscore_support(
-            labels, predictions, average=None, zero_division=0
-        )
-        
-        return {
-            'classification_report': report,
-            'confusion_matrix': cm,
-            'per_class_precision': precision,
-            'per_class_recall': recall,
-            'per_class_f1': f1,
-            'per_class_support': support
-        }
+        # phase_names = [self.phase_mapping.get(i, f'Phase_{i}') for i in range(self.model.n_classes)]
+        try:
+            report = classification_report(
+                labels, predictions, 
+                target_names=phase_names,
+                output_dict=True,
+                zero_division=0,
+                labels=unique_classes
+            )
+            
+            # Confusion matrix
+            cm = confusion_matrix(labels, predictions)
+            
+            precision, recall, f1, support = precision_recall_fscore_support(
+                labels, predictions, average=None, zero_division=0, labels=unique_classes
+            )
+            
+            return {
+                'classification_report': report,
+                'confusion_matrix': cm,
+                'per_class_precision': precision,
+                'per_class_recall': recall,
+                'per_class_f1': f1,
+                'per_class_support': support,
+                'unique_classes': unique_classes,
+                'n_actual_classes': n_actual_classes
+            }
+        except Exception as e:
+            print(f"Error in detailed metrics computation: {e}")
+            print(f"Labels: {labels[:10]}...")  # Show first 10
+            print(f"Predictions: {predictions[:10]}...")  # Show first 10
+            
+            # Return minimal metrics to avoid crashing
+            return {
+                'classification_report': {},
+                'confusion_matrix': np.eye(n_actual_classes),
+                'per_class_precision': np.ones(n_actual_classes),
+                'per_class_recall': np.ones(n_actual_classes),
+                'per_class_f1': np.ones(n_actual_classes),
+                'per_class_support': np.ones(n_actual_classes),
+                'unique_classes': unique_classes,
+                'n_actual_classes': n_actual_classes
+            }
     
     def train(self, train_loader, val_loader, num_epochs=50, save_best=True, 
               model_save_path='best_contrast_model.pth', early_stopping_patience=10):
@@ -684,12 +770,22 @@ class ContrastPhaseTrainer:
             print(f"Learning Rate: {current_lr:.6f}")
             
             # Print per-class metrics
+            # Print per-class metrics
             print("\nPer-class metrics:")
-            for i, phase_name in self.phase_mapping.items():
-                if i < len(detailed_metrics['per_class_precision']):
-                    print(f"  {phase_name}: P={detailed_metrics['per_class_precision'][i]:.3f}, "
-                          f"R={detailed_metrics['per_class_recall'][i]:.3f}, "
-                          f"F1={detailed_metrics['per_class_f1'][i]:.3f}")
+            if self.phase_mapping:
+                for class_idx, phase_name in self.phase_mapping.items():
+                    # Convert key to integer to avoid type comparison issues
+                    idx = int(class_idx)  # This ensures we have a proper int
+                    
+                    # Check bounds safely
+                    if 0 <= idx < len(detailed_metrics['per_class_precision']):
+                        print(f"  {phase_name}: P={detailed_metrics['per_class_precision'][idx]:.3f}, "
+                            f"R={detailed_metrics['per_class_recall'][idx]:.3f}, "
+                            f"F1={detailed_metrics['per_class_f1'][idx]:.3f}")
+                    else:
+                        print(f"  {phase_name}: No metrics available (index {idx} out of range)")
+            else:
+                print("  Phase mapping not available")
             
             # Save best model
             if val_acc > best_val_acc:
@@ -800,8 +896,8 @@ class ContrastPhaseTrainer:
 
 
 def create_model_and_trainer(encoder_type, encoder_config, mlp_config=None, 
-                           n_classes=5, freeze_encoder=False, device='cuda', 
-                           learning_rate=1e-4, weight_decay=1e-4):
+                           n_classes=5, freeze_encoder='full', device='cuda', 
+                           learning_rate=1e-4, weight_decay=1e-4, phase_mapping=None):
     """
     Factory function to create model and trainer
     
@@ -847,7 +943,8 @@ def create_model_and_trainer(encoder_type, encoder_config, mlp_config=None,
         model=model,
         device=device,
         learning_rate=learning_rate,
-        weight_decay=weight_decay
+        weight_decay=weight_decay,
+        phase_mapping=phase_mapping
     )
     
     return model, trainer
@@ -869,7 +966,7 @@ def test_mlp_classifier():
         hidden_dims=[512, 256, 128],
         n_classes=n_classes,
         dropout_rate=0.3,
-        use_attention=True
+        use_attention=False
     )
     
     # Test input
@@ -912,7 +1009,7 @@ def test_end_to_end_model():
         encoder=encoder,
         encoder_name="DummyEncoder",
         n_classes=5,
-        freeze_encoder=False,
+        freeze_encoder='full',
         enable_gradcam=True
     )
     

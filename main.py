@@ -225,7 +225,7 @@ def run_inference(args):
                 )
         
         # Generate
-        phase_names = ['arterial', 'venous', 'delayed', 'non-contrast']
+        phase_names = ['non-contrast', 'arterial', 'venous', 'delayed']
         print(f"🎭 Generating {phase_names[args.target_phase]} from {phase_names[args.input_phase]}")
         
         generated_volume = generate_contrast_phase(

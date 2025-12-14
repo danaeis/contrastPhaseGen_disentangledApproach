@@ -72,7 +72,7 @@ class ContrastPhaseMLPExperiment:
         (self.output_dir / 'logs').mkdir(exist_ok=True)
         
         self.device = torch.device(config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
-        self.phase_mapping = create_phase_mapping()
+        self.phase_mapping = None
         
         # Store experiment results
         self.results = {}
@@ -87,16 +87,18 @@ class ContrastPhaseMLPExperiment:
         
         # if not DATA_FUNCTIONS_AVAILABLE:
         #     raise ImportError("Data functions not available. Please check data.py")
-        
+        print("configs", self.config)
         # Prepare dataset from folders
         data_path = self.config['data_path']
-        labels_csv = self.config.get('labels_csv')
+        labels_path = self.config.get('labels_csv')
+        if not labels_path:
+            labels_path = os.path.join(data_path, 'labels.csv')
+
+        if not os.path.exists(labels_path):
+            raise FileNotFoundError(f"Labels CSV not found: {labels_path}")
         
-        if labels_csv is None:
-            labels_csv = os.path.join(data_path, 'labels.csv')
-        
-        if not os.path.exists(labels_csv):
-            raise FileNotFoundError(f"Labels CSV not found: {labels_csv}")
+        labels_csv = pd.read_csv(labels_path)
+        self.phase_mapping = create_phase_mapping(np.unique(labels_csv['Label']))
         
         # Create train/val split
         train_data_dicts, val_data_dicts = prepare_dataset_from_folders(
@@ -195,7 +197,7 @@ class ContrastPhaseMLPExperiment:
         return {
             'hidden_dims': self.config.get('mlp_hidden_dims', [512, 256, 128]),
             'dropout_rate': self.config.get('mlp_dropout', 0.3),
-            'use_attention': self.config.get('mlp_use_attention', True),
+            'use_attention': self.config.get('mlp_use_attention', False),
             'attention_heads': self.config.get('mlp_attention_heads', 8)
         }
     
@@ -212,10 +214,11 @@ class ContrastPhaseMLPExperiment:
                 encoder_config=encoder_config['config'],
                 mlp_config=mlp_config,
                 n_classes=self.config.get('n_classes', 5),
-                freeze_encoder=self.config.get('freeze_encoder', False),
+                freeze_encoder=self.config.get('freeze_encoder', 'full'),
                 device=self.device,
                 learning_rate=self.config.get('learning_rate', 1e-4),
-                weight_decay=self.config.get('weight_decay', 1e-4)
+                weight_decay=self.config.get('weight_decay', 1e-4),
+                phase_mapping=self.phase_mapping
             )
             
             print(f"Model created: {model.encoder_name}")
@@ -296,7 +299,6 @@ class ContrastPhaseMLPExperiment:
     def _plot_confusion_matrix(self, cm, encoder_name, save_path):
         """Plot confusion matrix"""
         plt.figure(figsize=(10, 8))
-        
         # Get phase names
         phase_names = [self.phase_mapping.get(i, f'Phase_{i}') for i in range(len(cm))]
         
@@ -344,10 +346,10 @@ class ContrastPhaseMLPExperiment:
             if sample_count >= num_samples:
                 break
             
-            # Get data
             if isinstance(batch_data, dict):
-                images = batch_data['image'].to(self.device)
-                labels = batch_data['label'].to(self.device)
+                print(batch_data.columns())
+                images = batch_data['input_path'].to(self.device)
+                labels = batch_data['input_phase'].to(self.device)
             else:
                 images, labels = batch_data
                 images = images.to(self.device)
@@ -712,7 +714,7 @@ def create_default_config():
         'n_classes': 5,
         'latent_dim': 256,
         'max_slices': 32,
-        'freeze_encoder': False,
+        'freeze_encoder': 'full',
         
         # Encoder selection
         'use_medvit': True,
@@ -774,7 +776,7 @@ def main():
                        help='Number of contrast phases')
     parser.add_argument('--latent_dim', type=int, default=256, 
                        help='Latent dimension for encoders')
-    parser.add_argument('--freeze_encoder', action='store_true', 
+    parser.add_argument('--freeze_encoder', default='full', action='store_true', 
                        help='Freeze encoder weights during training')
     
     # Encoder selection

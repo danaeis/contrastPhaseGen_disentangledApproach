@@ -49,7 +49,7 @@ def quick_training_example():
     
     # Configuration for a quick test
     config = {
-        'data_path': 'data',  # Your data path
+        'data_path': '../ncct_cect/vindr_ds/original_volumes/Abdomen/raw_image/',  # Your data path
         'spatial_size': [64, 64, 64],  # Smaller size for quick testing
         'batch_size': 2,
         'n_classes': 5,
@@ -59,8 +59,8 @@ def quick_training_example():
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'output_dir': 'quick_test_results',
         'max_samples_debug': 20,  # Limit samples for quick test
-        'use_medvit': False,      # Disable slower models for quick test
-        'use_dinov3': False,
+        'use_medvit': True,      # Disable slower models for quick test
+        'use_dinov3': True,
         'use_timm_vit': True      # Only use one model for quick test
     }
     
@@ -287,11 +287,11 @@ def saliency_map_comparison_example():
         slice_idx = test_volume.shape[2] // 2
         
         # Original
-        axes[0, 0].imshow(test_volume[0, 0, slice_idx].cpu().numpy(), cmap='gray')
+        axes[0, 0].imshow(test_volume[0, 0, slice_idx].detach().cpu().numpy(), cmap='gray')
         axes[0, 0].set_title('Original (Axial)')
         axes[0, 0].axis('off')
         
-        axes[1, 0].imshow(test_volume[0, 0, :, slice_idx].cpu().numpy(), cmap='gray')
+        axes[1, 0].imshow(test_volume[0, 0, :, slice_idx].detach().cpu().numpy(), cmap='gray')
         axes[1, 0].set_title('Original (Coronal)')
         axes[1, 0].axis('off')
         

@@ -1,0 +1,60 @@
+{
+  "experiment_info": {
+    "timestamp": "2025-09-14T16:29:53.266828",
+    "config": {
+      "data_path": "../ncct_cect/vindr_ds/original_volumes/Abdomen/raw_image/",
+      "labels_csv": null,
+      "spatial_size": [
+        128,
+        128,
+        128
+      ],
+      "batch_size": 128,
+      "validation_split": 0.2,
+      "use_augmentation": true,
+      "max_samples_debug": null,
+      "n_classes": 5,
+      "latent_dim": 256,
+      "max_slices": 32,
+      "freeze_encoder": "full",
+      "use_medvit": true,
+      "use_timm_vit": true,
+      "use_dinov3": true,
+      "medvit_size": "small",
+      "medvit_pretrained_path": "pretrained_medvit_small.pth",
+      "aggregation_method": "lstm",
+      "timm_model_name": "vit_small_patch16_224",
+      "timm_pretrained": true,
+      "dinov3_size": "small",
+      "dinov3_pretrained": true,
+      "mlp_hidden_dims": [
+        512,
+        256,
+        128
+      ],
+      "mlp_dropout": 0.3,
+      "mlp_use_attention": true,
+      "mlp_attention_heads": 8,
+      "num_epochs": 50,
+      "learning_rate": 0.0001,
+      "weight_decay": 0.0001,
+      "early_stopping_patience": 10,
+      "device": "cuda",
+      "output_dir": "contrast_phase_mlp_results",
+      "debug_mode": false,
+      "inference_mode": false
+    },
+    "data_info": {
+      "train_samples": 524,
+      "val_samples": 132,
+      "spatial_size": [
+        128,
+        128,
+        128
+      ],
+      "batch_size": 128
+    },
+    "device": "cuda"
+  },
+  "results": {}
+}

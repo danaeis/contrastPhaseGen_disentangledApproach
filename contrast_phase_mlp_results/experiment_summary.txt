@@ -1,0 +1,10 @@
+CONTRAST PHASE CLASSIFICATION EXPERIMENT SUMMARY
+============================================================
+
+Timestamp: 2025-09-14T16:29:53.266828
+Device: cuda
+Training samples: 524
+Validation samples: 132
+
+MODEL RESULTS:
+------------------------------
